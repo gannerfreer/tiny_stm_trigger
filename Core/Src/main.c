@@ -47,8 +47,23 @@
 #define DIGITAL_INPUT_ACTIVE_LEVEL            GPIO_PIN_SET
 #define DIGITAL_INPUT_STABLE_COUNT            3U
 
-#define OUT_ENABLE_LATCH_MODE                 0U
 #define ADC_READ_FAIL_TRIGGERS_PROTECTION     1U
+
+#define LED0_TOGGLE_PERIOD_MS                500U
+#define LED1_TOGGLE_PERIOD_MS                100U
+
+#if ((LED0_TOGGLE_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
+#error "LED0_TOGGLE_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
+#endif
+#if ((LED1_TOGGLE_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
+#error "LED1_TOGGLE_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
+#endif
+
+#define LED0_TOGGLE_TICKS                     (LED0_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
+#define LED1_TOGGLE_TICKS                     (LED1_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
+
+/* If LED wiring is active-low (common), OFF=SET and ON=RESET. Adjust if needed. */
+#define LED_OFF_STATE                         GPIO_PIN_SET
 
 /* USER CODE END PD */
 
@@ -66,9 +81,10 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 static uint32_t boot_tick_ms;
-static uint32_t last_logic_tick_ms;
 static uint8_t digital_active_counts[3];
 static uint8_t protection_latched;
+static uint16_t led0_tick_count;
+static uint16_t led1_tick_count;
 
 /* USER CODE END PV */
 
@@ -81,6 +97,8 @@ static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void CoreProtection_Init(void);
 static void CoreProtection_Update(void);
+static void Led_Init(void);
+static void Led_Update(void);
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
                                            uint16_t *analog1,
                                            uint16_t *analog2,
@@ -99,8 +117,9 @@ static void CoreProtection_Init(void)
   uint8_t i;
 
   boot_tick_ms = HAL_GetTick();
-  last_logic_tick_ms = boot_tick_ms;
   protection_latched = 0U;
+  led0_tick_count = 0U;
+  led1_tick_count = 0U;
 
   for (i = 0U; i < 3U; i++)
   {
@@ -109,6 +128,36 @@ static void CoreProtection_Init(void)
 
   (void)HAL_ADCEx_Calibration_Start(&hadc);
   SetOutEnableState(GPIO_PIN_RESET);
+}
+
+static void Led_Init(void)
+{
+  HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, LED_OFF_STATE);
+  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, LED_OFF_STATE);
+}
+
+static void Led_Update(void)
+{
+  led0_tick_count++;
+  if (led0_tick_count >= LED0_TOGGLE_TICKS)
+  {
+    led0_tick_count = 0U;
+    HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+  }
+
+  if (protection_latched == 0U)
+  {
+    led1_tick_count = 0U;
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, LED_OFF_STATE);
+    return;
+  }
+
+  led1_tick_count++;
+  if (led1_tick_count >= LED1_TOGGLE_TICKS)
+  {
+    led1_tick_count = 0U;
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+  }
 }
 
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
@@ -214,11 +263,6 @@ static void CoreProtection_Update(void)
   uint16_t temperature_raw = 0U;
 
   now_ms = HAL_GetTick();
-  if ((now_ms - last_logic_tick_ms) < CORE_LOGIC_PERIOD_MS)
-  {
-    return;
-  }
-  last_logic_tick_ms = now_ms;
 
   boot_guard_active = ((now_ms - boot_tick_ms) < BOOT_GUARD_MS) ? 1U : 0U;
   digital_fault = ReadDigitalFaultStable();
@@ -240,18 +284,15 @@ static void CoreProtection_Update(void)
   if (boot_guard_active != 0U)
   {
     protection_latched = 0U;
-    protection_triggered = 0U;
+    SetOutEnableState(GPIO_PIN_RESET);
+    return;
   }
 
-#if OUT_ENABLE_LATCH_MODE
   if (protection_triggered != 0U)
   {
     protection_latched = 1U;
   }
   SetOutEnableState((protection_latched != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-#else
-  SetOutEnableState((protection_triggered != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-#endif
 }
 
 /* USER CODE END 0 */
@@ -290,6 +331,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   CoreProtection_Init();
+  Led_Init();
 
   /* USER CODE END 2 */
 
@@ -297,10 +339,17 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    uint32_t loop_start_ms = HAL_GetTick();
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
     CoreProtection_Update();
+    Led_Update();
+    while ((HAL_GetTick() - loop_start_ms) < CORE_LOGIC_PERIOD_MS)
+    {
+      __NOP();
+    }
   }
   /* USER CODE END 3 */
 }
