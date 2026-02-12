@@ -21,11 +21,25 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "serial_log.h"
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct
+{
+  uint16_t analog0;
+  uint16_t analog1;
+  uint16_t analog2;
+  uint16_t temperature_raw;
+  uint8_t analog_fault;
+  uint8_t temp_fault;
+  uint8_t digital_fault;
+  uint8_t boot_guard_active;
+  uint8_t protection_latched;
+  uint8_t adc_ok;
+} CoreStatusSnapshot;
 
 /* USER CODE END PTD */
 
@@ -51,6 +65,7 @@
 
 #define LED0_TOGGLE_PERIOD_MS                500U
 #define LED1_TOGGLE_PERIOD_MS                100U
+#define UART_STATUS_PRINT_PERIOD_MS          500U
 
 #if ((LED0_TOGGLE_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
 #error "LED0_TOGGLE_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
@@ -58,9 +73,13 @@
 #if ((LED1_TOGGLE_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
 #error "LED1_TOGGLE_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
 #endif
+#if ((UART_STATUS_PRINT_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
+#error "UART_STATUS_PRINT_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
+#endif
 
 #define LED0_TOGGLE_TICKS                     (LED0_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 #define LED1_TOGGLE_TICKS                     (LED1_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
+#define UART_STATUS_PRINT_TICKS               (UART_STATUS_PRINT_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 
 /* If LED wiring is active-low (common), OFF=SET and ON=RESET. Adjust if needed. */
 #define LED_OFF_STATE                         GPIO_PIN_SET
@@ -85,6 +104,8 @@ static uint8_t digital_active_counts[3];
 static uint8_t protection_latched;
 static uint16_t led0_tick_count;
 static uint16_t led1_tick_count;
+static uint16_t uart_print_tick_count;
+static CoreStatusSnapshot core_status;
 
 /* USER CODE END PV */
 
@@ -99,6 +120,7 @@ static void CoreProtection_Init(void);
 static void CoreProtection_Update(void);
 static void Led_Init(void);
 static void Led_Update(void);
+static void UartStatus_Update(void);
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
                                            uint16_t *analog1,
                                            uint16_t *analog2,
@@ -120,6 +142,8 @@ static void CoreProtection_Init(void)
   protection_latched = 0U;
   led0_tick_count = 0U;
   led1_tick_count = 0U;
+  uart_print_tick_count = 0U;
+  core_status = (CoreStatusSnapshot){0};
 
   for (i = 0U; i < 3U; i++)
   {
@@ -158,6 +182,29 @@ static void Led_Update(void)
     led1_tick_count = 0U;
     HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
   }
+}
+
+static void UartStatus_Update(void)
+{
+  uart_print_tick_count++;
+  if (uart_print_tick_count < UART_STATUS_PRINT_TICKS)
+  {
+    return;
+  }
+  uart_print_tick_count = 0U;
+
+  SerialLog_Printf("tick=%lu guard=%u latched=%u adc_ok=%u a0=%u a1=%u a2=%u temp=%u af=%u tf=%u df=%u\r\n",
+                   (unsigned long)HAL_GetTick(),
+                   core_status.boot_guard_active,
+                   core_status.protection_latched,
+                   core_status.adc_ok,
+                   core_status.analog0,
+                   core_status.analog1,
+                   core_status.analog2,
+                   core_status.temperature_raw,
+                   core_status.analog_fault,
+                   core_status.temp_fault,
+                   core_status.digital_fault);
 }
 
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
@@ -266,6 +313,8 @@ static void CoreProtection_Update(void)
 
   boot_guard_active = ((now_ms - boot_tick_ms) < BOOT_GUARD_MS) ? 1U : 0U;
   digital_fault = ReadDigitalFaultStable();
+  core_status.boot_guard_active = boot_guard_active;
+  core_status.digital_fault = digital_fault;
 
   if (ReadCoreAdcInputs(&analog0, &analog1, &analog2, &temperature_raw) == HAL_OK)
   {
@@ -273,11 +322,19 @@ static void CoreProtection_Update(void)
     analog_fault |= IsOutOfRange(analog1, ANALOG_INPUT1_MIN, ANALOG_INPUT1_MAX);
     analog_fault |= IsOutOfRange(analog2, ANALOG_INPUT2_MIN, ANALOG_INPUT2_MAX);
     temp_fault = IsOutOfRange(temperature_raw, TEMP_SENSOR_ADC_MIN, TEMP_SENSOR_ADC_MAX);
+    core_status.adc_ok = 1U;
   }
   else
   {
     analog_fault = ADC_READ_FAIL_TRIGGERS_PROTECTION;
+    core_status.adc_ok = 0U;
   }
+  core_status.analog0 = analog0;
+  core_status.analog1 = analog1;
+  core_status.analog2 = analog2;
+  core_status.temperature_raw = temperature_raw;
+  core_status.analog_fault = analog_fault;
+  core_status.temp_fault = temp_fault;
 
   protection_triggered = ((analog_fault != 0U) || (temp_fault != 0U) || (digital_fault != 0U)) ? 1U : 0U;
 
@@ -285,6 +342,7 @@ static void CoreProtection_Update(void)
   {
     protection_latched = 0U;
     SetOutEnableState(GPIO_PIN_RESET);
+    core_status.protection_latched = protection_latched;
     return;
   }
 
@@ -293,6 +351,7 @@ static void CoreProtection_Update(void)
     protection_latched = 1U;
   }
   SetOutEnableState((protection_latched != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  core_status.protection_latched = protection_latched;
 }
 
 /* USER CODE END 0 */
@@ -330,6 +389,8 @@ int main(void)
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  SerialLog_Init(&huart1);
+  SerialLog_Print("System boot\r\n");
   CoreProtection_Init();
   Led_Init();
 
@@ -346,6 +407,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     CoreProtection_Update();
     Led_Update();
+    UartStatus_Update();
     while ((HAL_GetTick() - loop_start_ms) < CORE_LOGIC_PERIOD_MS)
     {
       __NOP();
