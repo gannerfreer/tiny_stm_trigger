@@ -31,6 +31,24 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BOOT_GUARD_MS                         15000U
+#define CORE_LOGIC_PERIOD_MS                  20U
+#define ADC_POLL_TIMEOUT_MS                   5U
+
+#define ANALOG_INPUT0_MIN                     0U
+#define ANALOG_INPUT0_MAX                     4095U
+#define ANALOG_INPUT1_MIN                     0U
+#define ANALOG_INPUT1_MAX                     4095U
+#define ANALOG_INPUT2_MIN                     0U
+#define ANALOG_INPUT2_MAX                     4095U
+#define TEMP_SENSOR_ADC_MIN                   0U
+#define TEMP_SENSOR_ADC_MAX                   4095U
+
+#define DIGITAL_INPUT_ACTIVE_LEVEL            GPIO_PIN_SET
+#define DIGITAL_INPUT_STABLE_COUNT            3U
+
+#define OUT_ENABLE_LATCH_MODE                 0U
+#define ADC_READ_FAIL_TRIGGERS_PROTECTION     1U
 
 /* USER CODE END PD */
 
@@ -47,6 +65,10 @@ I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+static uint32_t boot_tick_ms;
+static uint32_t last_logic_tick_ms;
+static uint8_t digital_active_counts[3];
+static uint8_t protection_latched;
 
 /* USER CODE END PV */
 
@@ -57,11 +79,180 @@ static void MX_ADC_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static void CoreProtection_Init(void);
+static void CoreProtection_Update(void);
+static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
+                                           uint16_t *analog1,
+                                           uint16_t *analog2,
+                                           uint16_t *temperature_raw);
+static uint8_t IsOutOfRange(uint16_t value, uint16_t min_value, uint16_t max_value);
+static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level);
+static uint8_t ReadDigitalFaultStable(void);
+static void SetOutEnableState(GPIO_PinState state);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void CoreProtection_Init(void)
+{
+  uint8_t i;
+
+  boot_tick_ms = HAL_GetTick();
+  last_logic_tick_ms = boot_tick_ms;
+  protection_latched = 0U;
+
+  for (i = 0U; i < 3U; i++)
+  {
+    digital_active_counts[i] = 0U;
+  }
+
+  (void)HAL_ADCEx_Calibration_Start(&hadc);
+  SetOutEnableState(GPIO_PIN_RESET);
+}
+
+static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
+                                           uint16_t *analog1,
+                                           uint16_t *analog2,
+                                           uint16_t *temperature_raw)
+{
+  uint16_t samples[4];
+  uint32_t i;
+
+  if (HAL_ADC_Start(&hadc) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  for (i = 0U; i < 4U; i++)
+  {
+    if (HAL_ADC_PollForConversion(&hadc, ADC_POLL_TIMEOUT_MS) != HAL_OK)
+    {
+      (void)HAL_ADC_Stop(&hadc);
+      return HAL_ERROR;
+    }
+    samples[i] = (uint16_t)HAL_ADC_GetValue(&hadc);
+  }
+
+  (void)HAL_ADC_Stop(&hadc);
+
+  *analog0 = samples[0];
+  *analog1 = samples[1];
+  *analog2 = samples[2];
+  *temperature_raw = samples[3];
+
+  return HAL_OK;
+}
+
+static uint8_t IsOutOfRange(uint16_t value, uint16_t min_value, uint16_t max_value)
+{
+  if ((value < min_value) || (value > max_value))
+  {
+    return 1U;
+  }
+  return 0U;
+}
+
+static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level)
+{
+  if (level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  {
+    if (*counter < DIGITAL_INPUT_STABLE_COUNT)
+    {
+      (*counter)++;
+    }
+  }
+  else
+  {
+    *counter = 0U;
+  }
+
+  if (*counter >= DIGITAL_INPUT_STABLE_COUNT)
+  {
+    return 1U;
+  }
+  return 0U;
+}
+
+static uint8_t ReadDigitalFaultStable(void)
+{
+  uint8_t input0_active;
+  uint8_t input1_active;
+  uint8_t input2_active;
+
+  input0_active = UpdateDigitalCounter(&digital_active_counts[0],
+                                       HAL_GPIO_ReadPin(DigitalInput0_GPIO_Port, DigitalInput0_Pin));
+  input1_active = UpdateDigitalCounter(&digital_active_counts[1],
+                                       HAL_GPIO_ReadPin(DigitalInput1_GPIO_Port, DigitalInput1_Pin));
+  input2_active = UpdateDigitalCounter(&digital_active_counts[2],
+                                       HAL_GPIO_ReadPin(DigitalInput2_GPIO_Port, DigitalInput2_Pin));
+
+  if ((input0_active != 0U) || (input1_active != 0U) || (input2_active != 0U))
+  {
+    return 1U;
+  }
+  return 0U;
+}
+
+static void SetOutEnableState(GPIO_PinState state)
+{
+  HAL_GPIO_WritePin(OutEnable0_GPIO_Port, OutEnable0_Pin, state);
+  HAL_GPIO_WritePin(OutEnable1_GPIO_Port, OutEnable1_Pin, state);
+}
+
+static void CoreProtection_Update(void)
+{
+  uint32_t now_ms;
+  uint8_t boot_guard_active;
+  uint8_t analog_fault = 0U;
+  uint8_t digital_fault;
+  uint8_t temp_fault = 0U;
+  uint8_t protection_triggered;
+  uint16_t analog0 = 0U;
+  uint16_t analog1 = 0U;
+  uint16_t analog2 = 0U;
+  uint16_t temperature_raw = 0U;
+
+  now_ms = HAL_GetTick();
+  if ((now_ms - last_logic_tick_ms) < CORE_LOGIC_PERIOD_MS)
+  {
+    return;
+  }
+  last_logic_tick_ms = now_ms;
+
+  boot_guard_active = ((now_ms - boot_tick_ms) < BOOT_GUARD_MS) ? 1U : 0U;
+  digital_fault = ReadDigitalFaultStable();
+
+  if (ReadCoreAdcInputs(&analog0, &analog1, &analog2, &temperature_raw) == HAL_OK)
+  {
+    analog_fault |= IsOutOfRange(analog0, ANALOG_INPUT0_MIN, ANALOG_INPUT0_MAX);
+    analog_fault |= IsOutOfRange(analog1, ANALOG_INPUT1_MIN, ANALOG_INPUT1_MAX);
+    analog_fault |= IsOutOfRange(analog2, ANALOG_INPUT2_MIN, ANALOG_INPUT2_MAX);
+    temp_fault = IsOutOfRange(temperature_raw, TEMP_SENSOR_ADC_MIN, TEMP_SENSOR_ADC_MAX);
+  }
+  else
+  {
+    analog_fault = ADC_READ_FAIL_TRIGGERS_PROTECTION;
+  }
+
+  protection_triggered = ((analog_fault != 0U) || (temp_fault != 0U) || (digital_fault != 0U)) ? 1U : 0U;
+
+  if (boot_guard_active != 0U)
+  {
+    protection_latched = 0U;
+    protection_triggered = 0U;
+  }
+
+#if OUT_ENABLE_LATCH_MODE
+  if (protection_triggered != 0U)
+  {
+    protection_latched = 1U;
+  }
+  SetOutEnableState((protection_latched != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+#else
+  SetOutEnableState((protection_triggered != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+#endif
+}
 
 /* USER CODE END 0 */
 
@@ -98,6 +289,7 @@ int main(void)
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  CoreProtection_Init();
 
   /* USER CODE END 2 */
 
@@ -108,6 +300,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    CoreProtection_Update();
   }
   /* USER CODE END 3 */
 }
@@ -339,7 +532,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, OutEnable0_Pin|OutEnable1_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOA, OutEnable0_Pin|OutEnable1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LED0_Pin|LED1_Pin, GPIO_PIN_SET);
@@ -351,9 +544,21 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : Key0_Pin Key1_Pin Key2_Pin */
+  GPIO_InitStruct.Pin = Key0_Pin|Key1_Pin|Key2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Key3_Pin */
+  GPIO_InitStruct.Pin = Key3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Key3_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pins : DigitalInput0_Pin DigitalInput1_Pin DigitalInput2_Pin */
   GPIO_InitStruct.Pin = DigitalInput0_Pin|DigitalInput1_Pin|DigitalInput2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
