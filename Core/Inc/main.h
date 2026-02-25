@@ -49,6 +49,8 @@ extern "C" {
 
 /* USER CODE END EM */
 
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -57,30 +59,32 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define OutEnable0_Pin GPIO_PIN_0
-#define OutEnable0_GPIO_Port GPIOA
-#define OutEnable1_Pin GPIO_PIN_1
-#define OutEnable1_GPIO_Port GPIOA
+#define ADC_T1_Pin GPIO_PIN_1
+#define ADC_T1_GPIO_Port GPIOA
 #define Key0_Pin GPIO_PIN_4
 #define Key0_GPIO_Port GPIOA
 #define Key1_Pin GPIO_PIN_5
 #define Key1_GPIO_Port GPIOA
 #define Key2_Pin GPIO_PIN_6
 #define Key2_GPIO_Port GPIOA
-#define AnalogInput0_Pin GPIO_PIN_7
-#define AnalogInput0_GPIO_Port GPIOA
-#define AnalogInput1_Pin GPIO_PIN_0
-#define AnalogInput1_GPIO_Port GPIOB
-#define AnalogInput2_Pin GPIO_PIN_1
-#define AnalogInput2_GPIO_Port GPIOB
+#define ADC_T2_Pin GPIO_PIN_7
+#define ADC_T2_GPIO_Port GPIOA
 #define Key3_Pin GPIO_PIN_2
 #define Key3_GPIO_Port GPIOB
-#define DigitalInput0_Pin GPIO_PIN_10
-#define DigitalInput0_GPIO_Port GPIOA
-#define DigitalInput1_Pin GPIO_PIN_11
-#define DigitalInput1_GPIO_Port GPIOA
-#define DigitalInput2_Pin GPIO_PIN_12
-#define DigitalInput2_GPIO_Port GPIOA
+#define GAS_D1_Pin GPIO_PIN_12
+#define GAS_D1_GPIO_Port GPIOB
+#define GAS_D2_Pin GPIO_PIN_13
+#define GAS_D2_GPIO_Port GPIOB
+#define PWM1_Pin GPIO_PIN_8
+#define PWM1_GPIO_Port GPIOA
+#define PWM2_Pin GPIO_PIN_9
+#define PWM2_GPIO_Port GPIOA
+#define PWM3_Pin GPIO_PIN_10
+#define PWM3_GPIO_Port GPIOA
+#define CLOSE_Pin GPIO_PIN_12
+#define CLOSE_GPIO_Port GPIOA
+#define OPEN_Pin GPIO_PIN_15
+#define OPEN_GPIO_Port GPIOA
 #define LED0_Pin GPIO_PIN_8
 #define LED0_GPIO_Port GPIOB
 #define LED1_Pin GPIO_PIN_9

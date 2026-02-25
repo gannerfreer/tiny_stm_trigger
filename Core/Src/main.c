@@ -29,13 +29,17 @@
 /* USER CODE BEGIN PTD */
 typedef struct
 {
-  uint16_t analog0;
-  uint16_t analog1;
-  uint16_t analog2;
+  uint16_t ad_t1_raw;
+  uint16_t ad_t2_raw;
+  uint16_t ad_t1_mv;
+  uint16_t ad_t2_mv;
   uint16_t temperature_raw;
-  uint8_t analog_fault;
-  uint8_t temp_fault;
+  uint16_t pwm0_duty;
+  uint16_t pwm1_duty;
+  uint16_t pwm2_duty;
+  uint8_t digital_state;
   uint8_t digital_fault;
+  uint8_t temp_fault;
   uint8_t boot_guard_active;
   uint8_t protection_latched;
   uint8_t adc_ok;
@@ -49,14 +53,29 @@ typedef struct
 #define CORE_LOGIC_PERIOD_MS                  20U
 #define ADC_POLL_TIMEOUT_MS                   5U
 
-#define ANALOG_INPUT0_MIN                     0U
-#define ANALOG_INPUT0_MAX                     4095U
-#define ANALOG_INPUT1_MIN                     0U
-#define ANALOG_INPUT1_MAX                     4095U
-#define ANALOG_INPUT2_MIN                     0U
-#define ANALOG_INPUT2_MAX                     4095U
 #define TEMP_SENSOR_ADC_MIN                   0U
 #define TEMP_SENSOR_ADC_MAX                   4095U
+
+#define ADC_FULL_SCALE                        4095U
+#define ADC_REF_MV                            3300U
+
+#define AD_T1_SCALE_NUM                       1U
+#define AD_T1_SCALE_DEN                       1U
+#define AD_T2_SCALE_NUM                       1U
+#define AD_T2_SCALE_DEN                       1U
+
+#define PWM_BASE_FREQ_HZ                      10000U
+#define PWM_TIMER_CLOCK_HZ                    48000000U
+#define PWM_TIMER_PERIOD                      ((PWM_TIMER_CLOCK_HZ / PWM_BASE_FREQ_HZ) - 1U)
+#define PWM_DUTY_MAX                           PWM_TIMER_PERIOD
+#define PWM0_TARGET_MV                         1500U
+#define PWM0_DEADBAND_MV                       25U
+#define PWM0_STEP_COUNTS                       20U
+
+#define DIGITAL_STATE_OPEN                     (1U << 0)
+#define DIGITAL_STATE_CLOSE                    (1U << 1)
+#define DIGITAL_STATE_GAS_D1                   (1U << 2)
+#define DIGITAL_STATE_GAS_D2                   (1U << 3)
 
 #define DIGITAL_INPUT_ACTIVE_LEVEL            GPIO_PIN_SET
 #define DIGITAL_INPUT_STABLE_COUNT            3U
@@ -96,12 +115,17 @@ ADC_HandleTypeDef hadc;
 
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim1;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 static uint32_t boot_tick_ms;
-static uint8_t digital_active_counts[3];
+static uint8_t digital_active_counts[4];
 static uint8_t protection_latched;
+static uint16_t pwm0_duty;
+static uint16_t pwm1_duty;
+static uint16_t pwm2_duty;
 static uint16_t led0_tick_count;
 static uint16_t led1_tick_count;
 static uint16_t uart_print_tick_count;
@@ -115,20 +139,22 @@ static void MX_GPIO_Init(void);
 static void MX_ADC_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 static void CoreProtection_Init(void);
 static void CoreProtection_Update(void);
 static void Led_Init(void);
 static void Led_Update(void);
 static void UartStatus_Update(void);
-static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
-                                           uint16_t *analog1,
-                                           uint16_t *analog2,
+static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
+                                           uint16_t *ad_t2_raw,
                                            uint16_t *temperature_raw);
 static uint8_t IsOutOfRange(uint16_t value, uint16_t min_value, uint16_t max_value);
 static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level);
 static uint8_t ReadDigitalFaultStable(void);
-static void SetOutEnableState(GPIO_PinState state);
+static uint16_t AdcRawToMv(uint16_t raw, uint32_t scale_num, uint32_t scale_den);
+static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv);
+static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2);
 
 /* USER CODE END PFP */
 
@@ -140,18 +166,33 @@ static void CoreProtection_Init(void)
 
   boot_tick_ms = HAL_GetTick();
   protection_latched = 0U;
+  pwm0_duty = 0U;
+  pwm1_duty = 0U;
+  pwm2_duty = 0U;
   led0_tick_count = 0U;
   led1_tick_count = 0U;
   uart_print_tick_count = 0U;
   core_status = (CoreStatusSnapshot){0};
 
-  for (i = 0U; i < 3U; i++)
+  for (i = 0U; i < 4U; i++)
   {
     digital_active_counts[i] = 0U;
   }
 
   (void)HAL_ADCEx_Calibration_Start(&hadc);
-  SetOutEnableState(GPIO_PIN_RESET);
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  ApplyPwmOutputs(0U, 0U, 0U);
 }
 
 static void Led_Init(void)
@@ -193,26 +234,29 @@ static void UartStatus_Update(void)
   }
   uart_print_tick_count = 0U;
 
-  SerialLog_Printf("tick=%lu guard=%u latched=%u adc_ok=%u a0=%u a1=%u a2=%u temp=%u af=%u tf=%u df=%u\r\n",
+  SerialLog_Printf("tick=%lu guard=%u latched=%u adc_ok=%u t1=%u t2=%u t1mv=%u t2mv=%u temp=%u din=0x%02X df=%u tf=%u pwm0=%u pwm1=%u pwm2=%u\r\n",
                    (unsigned long)HAL_GetTick(),
                    core_status.boot_guard_active,
                    core_status.protection_latched,
                    core_status.adc_ok,
-                   core_status.analog0,
-                   core_status.analog1,
-                   core_status.analog2,
+                   core_status.ad_t1_raw,
+                   core_status.ad_t2_raw,
+                   core_status.ad_t1_mv,
+                   core_status.ad_t2_mv,
                    core_status.temperature_raw,
-                   core_status.analog_fault,
+                   core_status.digital_state,
+                   core_status.digital_fault,
                    core_status.temp_fault,
-                   core_status.digital_fault);
+                   core_status.pwm0_duty,
+                   core_status.pwm1_duty,
+                   core_status.pwm2_duty);
 }
 
-static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
-                                           uint16_t *analog1,
-                                           uint16_t *analog2,
+static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
+                                           uint16_t *ad_t2_raw,
                                            uint16_t *temperature_raw)
 {
-  uint16_t samples[4];
+  uint16_t samples[3];
   uint32_t i;
 
   if (HAL_ADC_Start(&hadc) != HAL_OK)
@@ -220,7 +264,7 @@ static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
     return HAL_ERROR;
   }
 
-  for (i = 0U; i < 4U; i++)
+  for (i = 0U; i < 3U; i++)
   {
     if (HAL_ADC_PollForConversion(&hadc, ADC_POLL_TIMEOUT_MS) != HAL_OK)
     {
@@ -232,10 +276,9 @@ static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *analog0,
 
   (void)HAL_ADC_Stop(&hadc);
 
-  *analog0 = samples[0];
-  *analog1 = samples[1];
-  *analog2 = samples[2];
-  *temperature_raw = samples[3];
+  *ad_t1_raw = samples[0];
+  *ad_t2_raw = samples[1];
+  *temperature_raw = samples[2];
 
   return HAL_OK;
 }
@@ -272,42 +315,131 @@ static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level)
 
 static uint8_t ReadDigitalFaultStable(void)
 {
-  uint8_t input0_active;
-  uint8_t input1_active;
-  uint8_t input2_active;
+  uint8_t open_active;
+  uint8_t close_active;
+  uint8_t gas_d1_active;
+  uint8_t gas_d2_active;
+  GPIO_PinState open_level;
+  GPIO_PinState close_level;
+  GPIO_PinState gas_d1_level;
+  GPIO_PinState gas_d2_level;
+  uint8_t digital_state = 0U;
 
-  input0_active = UpdateDigitalCounter(&digital_active_counts[0],
-                                       HAL_GPIO_ReadPin(DigitalInput0_GPIO_Port, DigitalInput0_Pin));
-  input1_active = UpdateDigitalCounter(&digital_active_counts[1],
-                                       HAL_GPIO_ReadPin(DigitalInput1_GPIO_Port, DigitalInput1_Pin));
-  input2_active = UpdateDigitalCounter(&digital_active_counts[2],
-                                       HAL_GPIO_ReadPin(DigitalInput2_GPIO_Port, DigitalInput2_Pin));
+  open_level = HAL_GPIO_ReadPin(OPEN_GPIO_Port, OPEN_Pin);
+  close_level = HAL_GPIO_ReadPin(CLOSE_GPIO_Port, CLOSE_Pin);
+  gas_d1_level = HAL_GPIO_ReadPin(GAS_D1_GPIO_Port, GAS_D1_Pin);
+  gas_d2_level = HAL_GPIO_ReadPin(GAS_D2_GPIO_Port, GAS_D2_Pin);
 
-  if ((input0_active != 0U) || (input1_active != 0U) || (input2_active != 0U))
+  if (open_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  {
+    digital_state |= DIGITAL_STATE_OPEN;
+  }
+  if (close_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  {
+    digital_state |= DIGITAL_STATE_CLOSE;
+  }
+  if (gas_d1_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  {
+    digital_state |= DIGITAL_STATE_GAS_D1;
+  }
+  if (gas_d2_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  {
+    digital_state |= DIGITAL_STATE_GAS_D2;
+  }
+
+  open_active = UpdateDigitalCounter(&digital_active_counts[0], open_level);
+  close_active = UpdateDigitalCounter(&digital_active_counts[1], close_level);
+  gas_d1_active = UpdateDigitalCounter(&digital_active_counts[2], gas_d1_level);
+  gas_d2_active = UpdateDigitalCounter(&digital_active_counts[3], gas_d2_level);
+
+  core_status.digital_state = digital_state;
+
+  if ((open_active != 0U) || (close_active != 0U) || (gas_d1_active != 0U) || (gas_d2_active != 0U))
   {
     return 1U;
   }
   return 0U;
 }
 
-static void SetOutEnableState(GPIO_PinState state)
+static uint16_t AdcRawToMv(uint16_t raw, uint32_t scale_num, uint32_t scale_den)
 {
-  HAL_GPIO_WritePin(OutEnable0_GPIO_Port, OutEnable0_Pin, state);
-  HAL_GPIO_WritePin(OutEnable1_GPIO_Port, OutEnable1_Pin, state);
+  uint32_t mv;
+
+  mv = (uint32_t)raw * ADC_REF_MV;
+  mv = (mv + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
+  mv = (mv * scale_num + (scale_den / 2U)) / scale_den;
+  if (mv > 0xFFFFU)
+  {
+    mv = 0xFFFFU;
+  }
+  return (uint16_t)mv;
+}
+
+static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv)
+{
+  if (feedback_mv + PWM0_DEADBAND_MV < PWM0_TARGET_MV)
+  {
+    if ((PWM_DUTY_MAX - current_duty) < PWM0_STEP_COUNTS)
+    {
+      return PWM_DUTY_MAX;
+    }
+    return (uint16_t)(current_duty + PWM0_STEP_COUNTS);
+  }
+
+  if (feedback_mv > (PWM0_TARGET_MV + PWM0_DEADBAND_MV))
+  {
+    if (current_duty < PWM0_STEP_COUNTS)
+    {
+      return 0U;
+    }
+    return (uint16_t)(current_duty - PWM0_STEP_COUNTS);
+  }
+
+  return current_duty;
+}
+
+static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2)
+{
+  if (duty0 > PWM_DUTY_MAX)
+  {
+    duty0 = PWM_DUTY_MAX;
+  }
+  if (duty1 > PWM_DUTY_MAX)
+  {
+    duty1 = PWM_DUTY_MAX;
+  }
+  if (duty2 > PWM_DUTY_MAX)
+  {
+    duty2 = PWM_DUTY_MAX;
+  }
+
+  /* PWM0 -> TIM1_CH1 (PWM1_Pin), PWM1 -> TIM1_CH2 (PWM2_Pin), PWM2 -> TIM1_CH3 (PWM3_Pin). */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty1);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty2);
+
+  pwm0_duty = duty0;
+  pwm1_duty = duty1;
+  pwm2_duty = duty2;
+  core_status.pwm0_duty = duty0;
+  core_status.pwm1_duty = duty1;
+  core_status.pwm2_duty = duty2;
 }
 
 static void CoreProtection_Update(void)
 {
   uint32_t now_ms;
   uint8_t boot_guard_active;
-  uint8_t analog_fault = 0U;
   uint8_t digital_fault;
+  uint8_t adc_fault = 0U;
   uint8_t temp_fault = 0U;
   uint8_t protection_triggered;
-  uint16_t analog0 = 0U;
-  uint16_t analog1 = 0U;
-  uint16_t analog2 = 0U;
+  uint16_t ad_t1_raw = 0U;
+  uint16_t ad_t2_raw = 0U;
   uint16_t temperature_raw = 0U;
+  uint16_t ad_t1_mv = 0U;
+  uint16_t ad_t2_mv = 0U;
+  uint16_t target_pwm0;
 
   now_ms = HAL_GetTick();
 
@@ -316,32 +448,31 @@ static void CoreProtection_Update(void)
   core_status.boot_guard_active = boot_guard_active;
   core_status.digital_fault = digital_fault;
 
-  if (ReadCoreAdcInputs(&analog0, &analog1, &analog2, &temperature_raw) == HAL_OK)
+  if (ReadCoreAdcInputs(&ad_t1_raw, &ad_t2_raw, &temperature_raw) == HAL_OK)
   {
-    analog_fault |= IsOutOfRange(analog0, ANALOG_INPUT0_MIN, ANALOG_INPUT0_MAX);
-    analog_fault |= IsOutOfRange(analog1, ANALOG_INPUT1_MIN, ANALOG_INPUT1_MAX);
-    analog_fault |= IsOutOfRange(analog2, ANALOG_INPUT2_MIN, ANALOG_INPUT2_MAX);
     temp_fault = IsOutOfRange(temperature_raw, TEMP_SENSOR_ADC_MIN, TEMP_SENSOR_ADC_MAX);
+    ad_t1_mv = AdcRawToMv(ad_t1_raw, AD_T1_SCALE_NUM, AD_T1_SCALE_DEN);
+    ad_t2_mv = AdcRawToMv(ad_t2_raw, AD_T2_SCALE_NUM, AD_T2_SCALE_DEN);
     core_status.adc_ok = 1U;
   }
   else
   {
-    analog_fault = ADC_READ_FAIL_TRIGGERS_PROTECTION;
     core_status.adc_ok = 0U;
+    adc_fault = ADC_READ_FAIL_TRIGGERS_PROTECTION;
   }
-  core_status.analog0 = analog0;
-  core_status.analog1 = analog1;
-  core_status.analog2 = analog2;
+  core_status.ad_t1_raw = ad_t1_raw;
+  core_status.ad_t2_raw = ad_t2_raw;
+  core_status.ad_t1_mv = ad_t1_mv;
+  core_status.ad_t2_mv = ad_t2_mv;
   core_status.temperature_raw = temperature_raw;
-  core_status.analog_fault = analog_fault;
   core_status.temp_fault = temp_fault;
 
-  protection_triggered = ((analog_fault != 0U) || (temp_fault != 0U) || (digital_fault != 0U)) ? 1U : 0U;
+  protection_triggered = ((adc_fault != 0U) || (temp_fault != 0U) || (digital_fault != 0U)) ? 1U : 0U;
 
   if (boot_guard_active != 0U)
   {
     protection_latched = 0U;
-    SetOutEnableState(GPIO_PIN_RESET);
+    ApplyPwmOutputs(0U, 0U, 0U);
     core_status.protection_latched = protection_latched;
     return;
   }
@@ -350,7 +481,25 @@ static void CoreProtection_Update(void)
   {
     protection_latched = 1U;
   }
-  SetOutEnableState((protection_latched != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+  if (protection_latched == 0U)
+  {
+    ApplyPwmOutputs(0U, 0U, 0U);
+    core_status.protection_latched = protection_latched;
+    return;
+  }
+
+  target_pwm0 = pwm0_duty;
+  if (core_status.adc_ok != 0U)
+  {
+    target_pwm0 = AdjustPwm0Duty(pwm0_duty, ad_t1_mv);
+  }
+  else
+  {
+    target_pwm0 = 0U;
+  }
+
+  ApplyPwmOutputs(target_pwm0, PWM_DUTY_MAX, PWM_DUTY_MAX);
   core_status.protection_latched = protection_latched;
 }
 
@@ -388,6 +537,7 @@ int main(void)
   MX_ADC_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   SerialLog_Init(&huart1);
   SerialLog_Print("System boot\r\n");
@@ -505,7 +655,7 @@ static void MX_ADC_Init(void)
 
   /** Configure for the selected ADC regular channel to be converted.
   */
-  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
@@ -515,15 +665,7 @@ static void MX_ADC_Init(void)
 
   /** Configure for the selected ADC regular channel to be converted.
   */
-  sConfig.Channel = ADC_CHANNEL_8;
-  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure for the selected ADC regular channel to be converted.
-  */
-  sConfig.Channel = ADC_CHANNEL_9;
+  sConfig.Channel = ADC_CHANNEL_7;
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -591,6 +733,89 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = PWM_TIMER_PERIOD;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -643,17 +868,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, OutEnable0_Pin|OutEnable1_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LED0_Pin|LED1_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pins : OutEnable0_Pin OutEnable1_Pin */
-  GPIO_InitStruct.Pin = OutEnable0_Pin|OutEnable1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : Key0_Pin Key1_Pin Key2_Pin */
   GPIO_InitStruct.Pin = Key0_Pin|Key1_Pin|Key2_Pin;
@@ -667,8 +882,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(Key3_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DigitalInput0_Pin DigitalInput1_Pin DigitalInput2_Pin */
-  GPIO_InitStruct.Pin = DigitalInput0_Pin|DigitalInput1_Pin|DigitalInput2_Pin;
+  /*Configure GPIO pins : GAS_D1_Pin GAS_D2_Pin */
+  GPIO_InitStruct.Pin = GAS_D1_Pin|GAS_D2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : CLOSE_Pin OPEN_Pin */
+  GPIO_InitStruct.Pin = CLOSE_Pin|OPEN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
