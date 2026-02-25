@@ -20,6 +20,7 @@ set(MX_Include_Dirs
 # STM32CubeMX generated application sources
 set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Inc/Oled/oled.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/serial_log.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32f0xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32f0xx_hal_msp.c

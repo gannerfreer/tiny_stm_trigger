@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "serial_log.h"
+#include "Oled/oled.h"
 
 /* USER CODE END Includes */
 
@@ -595,6 +596,9 @@ int main(void)
   SerialLog_Print("System boot\r\n");
   CoreProtection_Init();
   Led_Init();
+  OLED_Init(&hi2c1);
+  OLED_Clear();
+  OLED_ShowString(0U, 0U, "Hello world", 16U);
 
   /* USER CODE END 2 */
 
@@ -954,10 +958,10 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /**/
-  HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PB8);
+  HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PB6);
 
   /**/
-  HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PB9);
+  HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PB7);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
