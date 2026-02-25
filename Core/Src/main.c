@@ -33,6 +33,7 @@ typedef struct
   uint16_t ad_t2_raw;
   uint16_t ad_t1_mv;
   uint16_t ad_t2_mv;
+  uint16_t input_mv;
   uint16_t temperature_raw;
   uint16_t pwm0_duty;
   uint16_t pwm1_duty;
@@ -53,16 +54,26 @@ typedef struct
 #define CORE_LOGIC_PERIOD_MS                  20U
 #define ADC_POLL_TIMEOUT_MS                   5U
 
-#define TEMP_SENSOR_ADC_MIN                   0U
-#define TEMP_SENSOR_ADC_MAX                   4095U
+#define TEMP_MIN                              0U
+#define TEMP_MAX                              4095U
 
 #define ADC_FULL_SCALE                        4095U
 #define ADC_REF_MV                            3300U
 
-#define AD_T1_SCALE_NUM                       1U
-#define AD_T1_SCALE_DEN                       1U
-#define AD_T2_SCALE_NUM                       1U
-#define AD_T2_SCALE_DEN                       1U
+/* TODO: replace divider/calibration factors with measured values. */
+#define AD_T1_DIVIDER_NUM                     1U
+#define AD_T1_DIVIDER_DEN                     1U
+#define AD_T1_CAL_NUM                         1U
+#define AD_T1_CAL_DEN                         1U
+#define AD_T2_DIVIDER_NUM                     1U
+#define AD_T2_DIVIDER_DEN                     1U
+#define AD_T2_CAL_NUM                         1U
+#define AD_T2_CAL_DEN                         1U
+
+#define AD_T1_SCALE_NUM                       (AD_T1_DIVIDER_NUM * AD_T1_CAL_NUM)
+#define AD_T1_SCALE_DEN                       (AD_T1_DIVIDER_DEN * AD_T1_CAL_DEN)
+#define AD_T2_SCALE_NUM                       (AD_T2_DIVIDER_NUM * AD_T2_CAL_NUM)
+#define AD_T2_SCALE_DEN                       (AD_T2_DIVIDER_DEN * AD_T2_CAL_DEN)
 
 #define PWM_BASE_FREQ_HZ                      10000U
 #define PWM_TIMER_CLOCK_HZ                    48000000U
@@ -152,7 +163,9 @@ static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
 static uint8_t IsOutOfRange(uint16_t value, uint16_t min_value, uint16_t max_value);
 static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level);
 static uint8_t ReadDigitalFaultStable(void);
-static uint16_t AdcRawToMv(uint16_t raw, uint32_t scale_num, uint32_t scale_den);
+static uint16_t AdcRawToMv(uint16_t raw);
+static uint16_t ApplyVoltageScale(uint16_t mv, uint32_t scale_num, uint32_t scale_den);
+static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv);
 static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv);
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2);
 
@@ -234,7 +247,7 @@ static void UartStatus_Update(void)
   }
   uart_print_tick_count = 0U;
 
-  SerialLog_Printf("tick=%lu guard=%u latched=%u adc_ok=%u t1=%u t2=%u t1mv=%u t2mv=%u temp=%u din=0x%02X df=%u tf=%u pwm0=%u pwm1=%u pwm2=%u\r\n",
+  SerialLog_Printf("tick=%lu guard=%u latched=%u adc_ok=%u t1=%u t2=%u t1mv=%u t2mv=%u inmv=%u temp=%u din=0x%02X df=%u tf=%u pwm0=%u pwm1=%u pwm2=%u\r\n",
                    (unsigned long)HAL_GetTick(),
                    core_status.boot_guard_active,
                    core_status.protection_latched,
@@ -243,6 +256,7 @@ static void UartStatus_Update(void)
                    core_status.ad_t2_raw,
                    core_status.ad_t1_mv,
                    core_status.ad_t2_mv,
+                   core_status.input_mv,
                    core_status.temperature_raw,
                    core_status.digital_state,
                    core_status.digital_fault,
@@ -361,18 +375,43 @@ static uint8_t ReadDigitalFaultStable(void)
   return 0U;
 }
 
-static uint16_t AdcRawToMv(uint16_t raw, uint32_t scale_num, uint32_t scale_den)
+static uint16_t AdcRawToMv(uint16_t raw)
 {
   uint32_t mv;
 
   mv = (uint32_t)raw * ADC_REF_MV;
   mv = (mv + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
-  mv = (mv * scale_num + (scale_den / 2U)) / scale_den;
   if (mv > 0xFFFFU)
   {
     mv = 0xFFFFU;
   }
   return (uint16_t)mv;
+}
+
+static uint16_t ApplyVoltageScale(uint16_t mv, uint32_t scale_num, uint32_t scale_den)
+{
+  uint32_t scaled;
+
+  if (scale_den == 0U)
+  {
+    return mv;
+  }
+
+  scaled = (uint32_t)mv * scale_num;
+  scaled = (scaled + (scale_den / 2U)) / scale_den;
+  if (scaled > 0xFFFFU)
+  {
+    scaled = 0xFFFFU;
+  }
+  return (uint16_t)scaled;
+}
+
+static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv)
+{
+  uint32_t sum;
+
+  sum = (uint32_t)ad_t1_mv + (uint32_t)ad_t2_mv;
+  return (uint16_t)((sum + 1U) / 2U);
 }
 
 static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv)
@@ -437,8 +476,11 @@ static void CoreProtection_Update(void)
   uint16_t ad_t1_raw = 0U;
   uint16_t ad_t2_raw = 0U;
   uint16_t temperature_raw = 0U;
+  uint16_t ad_t1_pin_mv = 0U;
+  uint16_t ad_t2_pin_mv = 0U;
   uint16_t ad_t1_mv = 0U;
   uint16_t ad_t2_mv = 0U;
+  uint16_t input_mv = 0U;
   uint16_t target_pwm0;
 
   now_ms = HAL_GetTick();
@@ -450,9 +492,12 @@ static void CoreProtection_Update(void)
 
   if (ReadCoreAdcInputs(&ad_t1_raw, &ad_t2_raw, &temperature_raw) == HAL_OK)
   {
-    temp_fault = IsOutOfRange(temperature_raw, TEMP_SENSOR_ADC_MIN, TEMP_SENSOR_ADC_MAX);
-    ad_t1_mv = AdcRawToMv(ad_t1_raw, AD_T1_SCALE_NUM, AD_T1_SCALE_DEN);
-    ad_t2_mv = AdcRawToMv(ad_t2_raw, AD_T2_SCALE_NUM, AD_T2_SCALE_DEN);
+    temp_fault = IsOutOfRange(temperature_raw, TEMP_MIN, TEMP_MAX);
+    ad_t1_pin_mv = AdcRawToMv(ad_t1_raw);
+    ad_t2_pin_mv = AdcRawToMv(ad_t2_raw);
+    ad_t1_mv = ApplyVoltageScale(ad_t1_pin_mv, AD_T1_SCALE_NUM, AD_T1_SCALE_DEN);
+    ad_t2_mv = ApplyVoltageScale(ad_t2_pin_mv, AD_T2_SCALE_NUM, AD_T2_SCALE_DEN);
+    input_mv = ComputeInputVoltageMv(ad_t1_mv, ad_t2_mv);
     core_status.adc_ok = 1U;
   }
   else
@@ -464,6 +509,7 @@ static void CoreProtection_Update(void)
   core_status.ad_t2_raw = ad_t2_raw;
   core_status.ad_t1_mv = ad_t1_mv;
   core_status.ad_t2_mv = ad_t2_mv;
+  core_status.input_mv = input_mv;
   core_status.temperature_raw = temperature_raw;
   core_status.temp_fault = temp_fault;
 
@@ -489,10 +535,16 @@ static void CoreProtection_Update(void)
     return;
   }
 
-  target_pwm0 = pwm0_duty;
   if (core_status.adc_ok != 0U)
   {
-    target_pwm0 = AdjustPwm0Duty(pwm0_duty, ad_t1_mv);
+    if (input_mv == 0U)
+    {
+      target_pwm0 = 0U;
+    }
+    else
+    {
+      target_pwm0 = AdjustPwm0Duty(pwm0_duty, ad_t1_mv);
+    }
   }
   else
   {
