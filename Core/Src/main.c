@@ -89,7 +89,13 @@ typedef struct
 #define PWM_TIMER_CLOCK_HZ                    48000000U
 #define PWM_TIMER_PERIOD                      ((PWM_TIMER_CLOCK_HZ / PWM_BASE_FREQ_HZ) - 1U)
 #define PWM_DUTY_MAX                           PWM_TIMER_PERIOD
+#define PWM0_DUTY_LIMIT_PERCENT               20U
+#define PWM0_DUTY_LIMIT                       ((PWM_DUTY_MAX * PWM0_DUTY_LIMIT_PERCENT) / 100U)
 #define PWM0_TARGET_MV                         10500U
+
+#if (PWM0_DUTY_LIMIT_PERCENT > 100U)
+#error "PWM0_DUTY_LIMIT_PERCENT must be <= 100"
+#endif
 
 /* PID gains: duty = Kp*err + Ki*sum(err) + Kd*dErr. Tune as needed. */
 #define PWM0_PID_KP_NUM                        1U
@@ -709,7 +715,7 @@ static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
   p_term = (error * (int32_t)PWM0_PID_KP_NUM) / (int32_t)PWM0_PID_KP_DEN;
 
   pwm0_pid_integral += error;
-  i_limit = ((int32_t)PWM_DUTY_MAX * (int32_t)PWM0_PID_KI_DEN) / (int32_t)PWM0_PID_KI_NUM;
+  i_limit = ((int32_t)PWM0_DUTY_LIMIT * (int32_t)PWM0_PID_KI_DEN) / (int32_t)PWM0_PID_KI_NUM;
   if (pwm0_pid_integral > i_limit)
   {
     pwm0_pid_integral = i_limit;
@@ -729,9 +735,9 @@ static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
   {
     output = 0;
   }
-  else if (output > (int32_t)PWM_DUTY_MAX)
+  else if (output > (int32_t)PWM0_DUTY_LIMIT)
   {
-    output = (int32_t)PWM_DUTY_MAX;
+    output = (int32_t)PWM0_DUTY_LIMIT;
   }
 
   return (uint16_t)output;
