@@ -157,6 +157,12 @@ static uint16_t led1_tick_count;
 static uint16_t uart_print_tick_count;
 static uint16_t oled_update_tick_count;
 static CoreStatusSnapshot core_status;
+static uint32_t adc_fail_count;
+static uint32_t adc_last_error;
+static uint32_t adc_last_isr;
+static uint32_t adc_last_cr;
+static uint32_t adc_last_chselr;
+static uint8_t adc_last_status;
 
 /* USER CODE END PV */
 
@@ -207,6 +213,12 @@ static void CoreProtection_Init(void)
   uart_print_tick_count = 0U;
   oled_update_tick_count = 0U;
   core_status = (CoreStatusSnapshot){0};
+  adc_fail_count = 0U;
+  adc_last_error = 0U;
+  adc_last_isr = 0U;
+  adc_last_cr = 0U;
+  adc_last_chselr = 0U;
+  adc_last_status = (uint8_t)HAL_OK;
 
   for (i = 0U; i < 4U; i++)
   {
@@ -407,6 +419,46 @@ static void OledStatus_Update(void)
 
   OledDebug_Update();
 
+  if (core_status.adc_ok == 0U)
+  {
+    const char *status_tag = "??";
+    uint32_t fail_count_mod = adc_fail_count % 10000U;
+
+    switch ((HAL_StatusTypeDef)adc_last_status)
+    {
+      case HAL_OK:
+        status_tag = "OK";
+        break;
+      case HAL_ERROR:
+        status_tag = "ER";
+        break;
+      case HAL_BUSY:
+        status_tag = "BU";
+        break;
+      case HAL_TIMEOUT:
+        status_tag = "TO";
+        break;
+      default:
+        status_tag = "??";
+        break;
+    }
+
+    (void)snprintf(line, sizeof(line), "ADC:%s ER:%04lX", status_tag,
+                   (unsigned long)adc_last_error);
+    OledWriteLine(2U, line);
+
+    (void)snprintf(line, sizeof(line), "ISR:%04lX C:%04lu",
+                   (unsigned long)(adc_last_isr & 0xFFFFU),
+                   (unsigned long)fail_count_mod);
+    OledWriteLine(3U, line);
+
+    (void)snprintf(line, sizeof(line), "CR:%04lX CH:%05lX",
+                   (unsigned long)(adc_last_cr & 0xFFFFU),
+                   (unsigned long)(adc_last_chselr & 0x1FFFFU));
+    OledWriteLine(4U, line);
+    return;
+  }
+
   (void)snprintf(line, sizeof(line), "T1:%5u mV", (unsigned int)core_status.ad_t1_mv);
   OledWriteLine(2U, line);
 
@@ -431,24 +483,43 @@ static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
 {
   uint16_t samples[3];
   uint32_t i;
+  HAL_StatusTypeDef status;
 
-  if (HAL_ADC_Start(&hadc) != HAL_OK)
+  __HAL_ADC_CLEAR_FLAG(&hadc, ADC_FLAG_EOC | ADC_FLAG_EOS | ADC_FLAG_OVR | ADC_FLAG_EOSMP | ADC_FLAG_RDY);
+
+  status = HAL_ADC_Start(&hadc);
+  if (status != HAL_OK)
   {
+    adc_last_status = (uint8_t)status;
+    adc_last_error = HAL_ADC_GetError(&hadc);
+    adc_last_isr = hadc.Instance->ISR;
+    adc_last_cr = hadc.Instance->CR;
+    adc_last_chselr = hadc.Instance->CHSELR;
+    adc_fail_count++;
     return HAL_ERROR;
   }
 
   for (i = 0U; i < 3U; i++)
   {
-    if (HAL_ADC_PollForConversion(&hadc, ADC_POLL_TIMEOUT_MS) != HAL_OK)
+    status = HAL_ADC_PollForConversion(&hadc, ADC_POLL_TIMEOUT_MS);
+    if (status != HAL_OK)
     {
+      adc_last_status = (uint8_t)status;
+      adc_last_error = HAL_ADC_GetError(&hadc);
+      adc_last_isr = hadc.Instance->ISR;
+      adc_last_cr = hadc.Instance->CR;
+      adc_last_chselr = hadc.Instance->CHSELR;
+      adc_fail_count++;
       (void)HAL_ADC_Stop(&hadc);
-      return HAL_ERROR;
+      return status;
     }
     samples[i] = (uint16_t)HAL_ADC_GetValue(&hadc);
   }
 
   (void)HAL_ADC_Stop(&hadc);
 
+  adc_last_status = (uint8_t)HAL_OK;
+  adc_last_error = 0U;
   *ad_t1_raw = samples[0];
   *ad_t2_raw = samples[1];
   *temperature_raw = samples[2];
@@ -912,7 +983,7 @@ static void MX_ADC_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
   if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
   {
     Error_Handler();

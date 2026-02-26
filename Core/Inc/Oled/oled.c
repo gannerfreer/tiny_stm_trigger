@@ -196,21 +196,21 @@ uint8_t OLED_Debug_PrintLine(uint8_t line, const char *text)
   return 1U;
 }
 
-void OLED_ShowCHinese(uint8_t x, uint8_t y, uint8_t no)
-{
-  uint8_t t;
+// void OLED_ShowCHinese(uint8_t x, uint8_t y, uint8_t no)
+// {
+//   uint8_t t;
 
-  OLED_Set_Pos(x, y);
-  for (t = 0U; t < 16U; t++)
-  {
-    OLED_WR_Byte(Hzk[2U * no][t], OLED_DATA);
-  }
-  OLED_Set_Pos(x, (uint8_t)(y + 1U));
-  for (t = 0U; t < 16U; t++)
-  {
-    OLED_WR_Byte(Hzk[2U * no + 1U][t], OLED_DATA);
-  }
-}
+//   OLED_Set_Pos(x, y);
+//   for (t = 0U; t < 16U; t++)
+//   {
+//     OLED_WR_Byte(Hzk[2U * no][t], OLED_DATA);
+//   }
+//   OLED_Set_Pos(x, (uint8_t)(y + 1U));
+//   for (t = 0U; t < 16U; t++)
+//   {
+//     OLED_WR_Byte(Hzk[2U * no + 1U][t], OLED_DATA);
+//   }
+// }
 
 void OLED_DrawBMP(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1, const unsigned char *bmp)
 {
