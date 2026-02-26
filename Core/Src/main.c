@@ -62,8 +62,9 @@ typedef struct
 #define ADC_REF_MV                            3300U
 
 /* TODO: replace divider/calibration factors with measured values. */
-#define AD_T1_DIVIDER_NUM                     1U
-#define AD_T1_DIVIDER_DEN                     1U
+/* AD_T1: 10k (top) / 2.2k (bottom) divider => V_in = V_adc * (12.2 / 2.2) = 61/11 */
+#define AD_T1_DIVIDER_NUM                     61U
+#define AD_T1_DIVIDER_DEN                     11U
 #define AD_T1_CAL_NUM                         1U
 #define AD_T1_CAL_DEN                         1U
 #define AD_T2_DIVIDER_NUM                     1U
@@ -97,6 +98,7 @@ typedef struct
 #define LED0_TOGGLE_PERIOD_MS                500U
 #define LED1_TOGGLE_PERIOD_MS                100U
 #define UART_STATUS_PRINT_PERIOD_MS          500U
+#define OLED_UPDATE_PERIOD_MS                200U
 
 #if ((LED0_TOGGLE_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
 #error "LED0_TOGGLE_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
@@ -107,10 +109,14 @@ typedef struct
 #if ((UART_STATUS_PRINT_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
 #error "UART_STATUS_PRINT_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
 #endif
+#if ((OLED_UPDATE_PERIOD_MS % CORE_LOGIC_PERIOD_MS) != 0)
+#error "OLED_UPDATE_PERIOD_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
+#endif
 
 #define LED0_TOGGLE_TICKS                     (LED0_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 #define LED1_TOGGLE_TICKS                     (LED1_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 #define UART_STATUS_PRINT_TICKS               (UART_STATUS_PRINT_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
+#define OLED_UPDATE_TICKS                     (OLED_UPDATE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 
 /* If LED wiring is active-low (common), OFF=SET and ON=RESET. Adjust if needed. */
 #define LED_OFF_STATE                         GPIO_PIN_SET
@@ -141,6 +147,7 @@ static uint16_t pwm2_duty;
 static uint16_t led0_tick_count;
 static uint16_t led1_tick_count;
 static uint16_t uart_print_tick_count;
+static uint16_t oled_update_tick_count;
 static CoreStatusSnapshot core_status;
 
 /* USER CODE END PV */
@@ -158,6 +165,7 @@ static void CoreProtection_Update(void);
 static void Led_Init(void);
 static void Led_Update(void);
 static void UartStatus_Update(void);
+static void OledStatus_Update(void);
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
                                            uint16_t *ad_t2_raw,
                                            uint16_t *temperature_raw);
@@ -186,6 +194,7 @@ static void CoreProtection_Init(void)
   led0_tick_count = 0U;
   led1_tick_count = 0U;
   uart_print_tick_count = 0U;
+  oled_update_tick_count = 0U;
   core_status = (CoreStatusSnapshot){0};
 
   for (i = 0U; i < 4U; i++)
@@ -265,6 +274,25 @@ static void UartStatus_Update(void)
                    core_status.pwm0_duty,
                    core_status.pwm1_duty,
                    core_status.pwm2_duty);
+}
+
+static void OledStatus_Update(void)
+{
+  oled_update_tick_count++;
+  if (oled_update_tick_count < OLED_UPDATE_TICKS)
+  {
+    return;
+  }
+  oled_update_tick_count = 0U;
+
+  OLED_Clear();
+  OLED_ShowString(0U, 0U, "T1:", 16U);
+  OLED_ShowNum(24U, 0U, core_status.ad_t1_mv, 5U, 16U);
+  OLED_ShowString(64U, 0U, "mV", 16U);
+
+  OLED_ShowString(0U, 2U, "T2:", 16U);
+  OLED_ShowNum(24U, 2U, core_status.ad_t2_mv, 5U, 16U);
+  OLED_ShowString(64U, 2U, "mV", 16U);
 }
 
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
@@ -598,7 +626,6 @@ int main(void)
   Led_Init();
   OLED_Init(&hi2c1);
   OLED_Clear();
-  OLED_ShowString(0U, 0U, "Hello world", 16U);
 
   /* USER CODE END 2 */
 
@@ -614,6 +641,7 @@ int main(void)
     CoreProtection_Update();
     Led_Update();
     UartStatus_Update();
+    OledStatus_Update();
     while ((HAL_GetTick() - loop_start_ms) < CORE_LOGIC_PERIOD_MS)
     {
       __NOP();
