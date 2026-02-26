@@ -246,19 +246,13 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* htim)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     /**TIM1 GPIO Configuration
     PA8     ------> TIM1_CH1
-    PA9     ------> TIM1_CH2
-    PA10     ------> TIM1_CH3
     */
-    GPIO_InitStruct.Pin = PWM1_Pin|PWM2_Pin|PWM3_Pin;
+    GPIO_InitStruct.Pin = PWM1_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF2_TIM1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PA9);
-
-    HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PA10);
 
     /* USER CODE BEGIN TIM1_MspPostInit 1 */
 

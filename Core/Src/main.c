@@ -89,9 +89,19 @@ typedef struct
 #define PWM_TIMER_CLOCK_HZ                    48000000U
 #define PWM_TIMER_PERIOD                      ((PWM_TIMER_CLOCK_HZ / PWM_BASE_FREQ_HZ) - 1U)
 #define PWM_DUTY_MAX                           PWM_TIMER_PERIOD
-#define PWM0_TARGET_MV                         1500U
-#define PWM0_DEADBAND_MV                       25U
-#define PWM0_STEP_COUNTS                       20U
+#define PWM0_TARGET_MV                         10500U
+
+/* PID gains: duty = Kp*err + Ki*sum(err) + Kd*dErr. Tune as needed. */
+#define PWM0_PID_KP_NUM                        1U
+#define PWM0_PID_KP_DEN                        4U
+#define PWM0_PID_KI_NUM                        1U
+#define PWM0_PID_KI_DEN                        200U
+#define PWM0_PID_KD_NUM                        0U
+#define PWM0_PID_KD_DEN                        1U
+
+#if (PWM0_PID_KI_NUM == 0U)
+#error "PWM0_PID_KI_NUM must be non-zero"
+#endif
 
 #define DIGITAL_STATE_OPEN                     (1U << 0)
 #define DIGITAL_STATE_CLOSE                    (1U << 1)
@@ -156,6 +166,8 @@ static uint16_t led0_tick_count;
 static uint16_t led1_tick_count;
 static uint16_t uart_print_tick_count;
 static uint16_t oled_update_tick_count;
+static int32_t pwm0_pid_integral;
+static int32_t pwm0_pid_prev_error;
 static CoreStatusSnapshot core_status;
 static uint32_t adc_fail_count;
 static uint32_t adc_last_error;
@@ -192,7 +204,8 @@ static uint16_t AdcRawToMv(uint16_t raw);
 static uint16_t ApplyVoltageScale(uint16_t mv, uint32_t scale_num, uint32_t scale_den);
 static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv);
 static int16_t TemperatureRawToC10(uint16_t raw);
-static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv);
+static void ResetPwm0Pid(void);
+static uint16_t AdjustPwm0Duty(uint16_t feedback_mv);
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2);
 
 /* USER CODE END PFP */
@@ -212,6 +225,8 @@ static void CoreProtection_Init(void)
   led1_tick_count = 0U;
   uart_print_tick_count = 0U;
   oled_update_tick_count = 0U;
+  pwm0_pid_integral = 0;
+  pwm0_pid_prev_error = 0;
   core_status = (CoreStatusSnapshot){0};
   adc_fail_count = 0U;
   adc_last_error = 0U;
@@ -227,14 +242,6 @@ static void CoreProtection_Init(void)
 
   (void)HAL_ADCEx_Calibration_Start(&hadc);
   if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -683,27 +690,51 @@ static int16_t TemperatureRawToC10(uint16_t raw)
   return (int16_t)temp_c10;
 }
 
-static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv)
+static void ResetPwm0Pid(void)
 {
-  if (feedback_mv + PWM0_DEADBAND_MV < PWM0_TARGET_MV)
+  pwm0_pid_integral = 0;
+  pwm0_pid_prev_error = 0;
+}
+
+static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
+{
+  int32_t error = (int32_t)PWM0_TARGET_MV - (int32_t)feedback_mv;
+  int32_t p_term;
+  int32_t i_term;
+  int32_t d_term;
+  int32_t output;
+  int32_t i_limit;
+  int32_t delta_error;
+
+  p_term = (error * (int32_t)PWM0_PID_KP_NUM) / (int32_t)PWM0_PID_KP_DEN;
+
+  pwm0_pid_integral += error;
+  i_limit = ((int32_t)PWM_DUTY_MAX * (int32_t)PWM0_PID_KI_DEN) / (int32_t)PWM0_PID_KI_NUM;
+  if (pwm0_pid_integral > i_limit)
   {
-    if ((PWM_DUTY_MAX - current_duty) < PWM0_STEP_COUNTS)
-    {
-      return PWM_DUTY_MAX;
-    }
-    return (uint16_t)(current_duty + PWM0_STEP_COUNTS);
+    pwm0_pid_integral = i_limit;
+  }
+  else if (pwm0_pid_integral < -i_limit)
+  {
+    pwm0_pid_integral = -i_limit;
+  }
+  i_term = (pwm0_pid_integral * (int32_t)PWM0_PID_KI_NUM) / (int32_t)PWM0_PID_KI_DEN;
+
+  delta_error = error - pwm0_pid_prev_error;
+  d_term = (delta_error * (int32_t)PWM0_PID_KD_NUM) / (int32_t)PWM0_PID_KD_DEN;
+  pwm0_pid_prev_error = error;
+
+  output = p_term + i_term + d_term;
+  if (output < 0)
+  {
+    output = 0;
+  }
+  else if (output > (int32_t)PWM_DUTY_MAX)
+  {
+    output = (int32_t)PWM_DUTY_MAX;
   }
 
-  if (feedback_mv > (PWM0_TARGET_MV + PWM0_DEADBAND_MV))
-  {
-    if (current_duty < PWM0_STEP_COUNTS)
-    {
-      return 0U;
-    }
-    return (uint16_t)(current_duty - PWM0_STEP_COUNTS);
-  }
-
-  return current_duty;
+  return (uint16_t)output;
 }
 
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2)
@@ -721,10 +752,10 @@ static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2)
     duty2 = PWM_DUTY_MAX;
   }
 
-  /* PWM0 -> TIM1_CH1 (PWM1_Pin), PWM1 -> TIM1_CH2 (PWM2_Pin), PWM2 -> TIM1_CH3 (PWM3_Pin). */
+  /* PWM0 -> TIM1_CH1 (PWM1_Pin), PWM2/PWM3 as GPIO outputs. */
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty0);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty1);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty2);
+  HAL_GPIO_WritePin(PWM2_GPIO_Port, PWM2_Pin, (duty1 > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(PWM3_GPIO_Port, PWM3_Pin, (duty2 > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 
   pwm0_duty = duty0;
   pwm1_duty = duty1;
@@ -789,6 +820,7 @@ static void CoreProtection_Update(void)
   if (boot_guard_active != 0U)
   {
     protection_latched = 0U;
+    ResetPwm0Pid();
     ApplyPwmOutputs(0U, 0U, 0U);
     core_status.protection_latched = protection_latched;
     return;
@@ -801,6 +833,7 @@ static void CoreProtection_Update(void)
 
   if (protection_latched == 0U)
   {
+    ResetPwm0Pid();
     ApplyPwmOutputs(0U, 0U, 0U);
     core_status.protection_latched = protection_latched;
     return;
@@ -811,15 +844,17 @@ static void CoreProtection_Update(void)
     if (input_mv == 0U)
     {
       target_pwm0 = 0U;
+      ResetPwm0Pid();
     }
     else
     {
-      target_pwm0 = AdjustPwm0Duty(pwm0_duty, ad_t1_mv);
+      target_pwm0 = AdjustPwm0Duty(ad_t1_mv);
     }
   }
   else
   {
     target_pwm0 = 0U;
+    ResetPwm0Pid();
   }
 
   ApplyPwmOutputs(target_pwm0, PWM_DUTY_MAX, PWM_DUTY_MAX);
@@ -1195,6 +1230,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LED0_Pin|LED1_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOA, PWM2_Pin|PWM3_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : Key0_Pin Key1_Pin Key2_Pin */
   GPIO_InitStruct.Pin = Key0_Pin|Key1_Pin|Key2_Pin;
@@ -1226,6 +1262,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PWM2_Pin PWM3_Pin */
+  GPIO_InitStruct.Pin = PWM2_Pin|PWM3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /**/
   HAL_I2CEx_EnableFastModePlus(SYSCFG_CFGR1_I2C_FMP_PB6);
