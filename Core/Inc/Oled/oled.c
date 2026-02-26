@@ -3,6 +3,14 @@
 
 static I2C_HandleTypeDef *oled_i2c;
 
+#define OLED_DEBUG_LINE_COUNT 2U
+#define OLED_DEBUG_MAX_CHARS 16U
+
+static uint8_t OLED_IsPrintableAscii(uint8_t ch)
+{
+  return ((ch >= 0x20U) && (ch <= 0x7EU)) ? 1U : 0U;
+}
+
 static HAL_StatusTypeDef OLED_I2C_Write(uint8_t control, uint8_t data)
 {
   uint8_t buffer[2];
@@ -162,6 +170,30 @@ void OLED_ShowString(uint8_t x, uint8_t y, const char *chr, uint8_t char_size)
     }
     j++;
   }
+}
+
+uint8_t OLED_Debug_PrintLine(uint8_t line, const char *text)
+{
+  static const char blank_line[OLED_DEBUG_MAX_CHARS + 1U] = "                ";
+  char buffer[OLED_DEBUG_MAX_CHARS + 1U];
+  uint8_t i;
+
+  if ((text == NULL) || (line >= OLED_DEBUG_LINE_COUNT))
+  {
+    return 0U;
+  }
+
+  for (i = 0U; (i < OLED_DEBUG_MAX_CHARS) && (text[i] != '\0'); i++)
+  {
+    uint8_t ch = (uint8_t)text[i];
+
+    buffer[i] = (OLED_IsPrintableAscii(ch) != 0U) ? (char)ch : '?';
+  }
+  buffer[i] = '\0';
+
+  OLED_ShowString(0U, line, blank_line, 8U);
+  OLED_ShowString(0U, line, buffer, 8U);
+  return 1U;
 }
 
 void OLED_ShowCHinese(uint8_t x, uint8_t y, uint8_t no)

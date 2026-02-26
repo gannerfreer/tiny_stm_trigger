@@ -21,6 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
 #include "serial_log.h"
 #include "Oled/oled.h"
 
@@ -36,6 +39,7 @@ typedef struct
   uint16_t ad_t2_mv;
   uint16_t input_mv;
   uint16_t temperature_raw;
+  int16_t temperature_c10;
   uint16_t pwm0_duty;
   uint16_t pwm1_duty;
   uint16_t pwm2_duty;
@@ -60,6 +64,10 @@ typedef struct
 
 #define ADC_FULL_SCALE                        4095U
 #define ADC_REF_MV                            3300U
+#define TS_CAL1_ADDR                          ((uint16_t *)0x1FFFF7B8U)
+#define TS_CAL1_TEMP_C                        30
+#define TS_CAL1_VDDA_MV                        3300U
+#define TS_AVG_SLOPE_UV_PER_C                 4300U
 
 /* TODO: replace divider/calibration factors with measured values. */
 /* AD_T1: 10k (top) / 2.2k (bottom) divider => V_in = V_adc * (12.2 / 2.2) = 61/11 */
@@ -166,6 +174,8 @@ static void Led_Init(void);
 static void Led_Update(void);
 static void UartStatus_Update(void);
 static void OledStatus_Update(void);
+static void OledDebug_Update(void);
+static void OledWriteLine(uint8_t line, const char *text);
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
                                            uint16_t *ad_t2_raw,
                                            uint16_t *temperature_raw);
@@ -175,6 +185,7 @@ static uint8_t ReadDigitalFaultStable(void);
 static uint16_t AdcRawToMv(uint16_t raw);
 static uint16_t ApplyVoltageScale(uint16_t mv, uint32_t scale_num, uint32_t scale_den);
 static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv);
+static int16_t TemperatureRawToC10(uint16_t raw);
 static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv);
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2);
 
@@ -276,8 +287,117 @@ static void UartStatus_Update(void)
                    core_status.pwm2_duty);
 }
 
+static uint8_t OledTryAppendToken(char *line, size_t line_size, const char *token)
+{
+  size_t len = strlen(line);
+  size_t token_len = strlen(token);
+  size_t needed = token_len + ((len > 0U) ? 1U : 0U);
+
+  if ((len + needed) > (line_size - 1U))
+  {
+    return 0U;
+  }
+
+  if (len > 0U)
+  {
+    line[len] = '|';
+    len++;
+  }
+  (void)memcpy(&line[len], token, token_len);
+  line[len + token_len] = '\0';
+  return 1U;
+}
+
+static void OledAppendToken(char *line0,
+                            size_t line0_size,
+                            char *line1,
+                            size_t line1_size,
+                            const char *token)
+{
+  if (OledTryAppendToken(line0, line0_size, token) == 0U)
+  {
+    (void)OledTryAppendToken(line1, line1_size, token);
+  }
+}
+
+static void OledDebug_Update(void)
+{
+  char line0[17];
+  char line1[17];
+
+  if (core_status.boot_guard_active != 0U)
+  {
+    uint32_t now_ms = HAL_GetTick();
+    uint32_t elapsed_ms = now_ms - boot_tick_ms;
+    uint32_t remaining_ms = 0U;
+    uint32_t remaining_s;
+
+    if (elapsed_ms < BOOT_GUARD_MS)
+    {
+      remaining_ms = BOOT_GUARD_MS - elapsed_ms;
+    }
+    remaining_s = (remaining_ms + 999U) / 1000U;
+
+    (void)snprintf(line0, sizeof(line0), "System warming");
+    (void)snprintf(line1, sizeof(line1), "up T-%lus", (unsigned long)remaining_s);
+    OLED_Debug_PrintLine(0U, line0);
+    OLED_Debug_PrintLine(1U, line1);
+    return;
+  }
+
+  line0[0] = '\0';
+  line1[0] = '\0';
+
+  if ((core_status.digital_state & DIGITAL_STATE_OPEN) != 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "OPEN");
+  }
+  if ((core_status.digital_state & DIGITAL_STATE_CLOSE) != 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "CLOSE");
+  }
+  if ((core_status.digital_state & DIGITAL_STATE_GAS_D1) != 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "GAS1");
+  }
+  if ((core_status.digital_state & DIGITAL_STATE_GAS_D2) != 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "GAS2");
+  }
+  if (core_status.adc_ok == 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "ADC");
+  }
+  if (core_status.temp_fault != 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "TMP");
+  }
+  if (core_status.protection_latched != 0U)
+  {
+    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "LAT");
+  }
+
+  if ((line0[0] == '\0') && (line1[0] == '\0'))
+  {
+    (void)snprintf(line0, sizeof(line0), "OK");
+  }
+
+  OLED_Debug_PrintLine(0U, line0);
+  OLED_Debug_PrintLine(1U, line1);
+}
+
+static void OledWriteLine(uint8_t line, const char *text)
+{
+  static const char blank_line[17] = "                ";
+
+  OLED_ShowString(0U, line, blank_line, 8U);
+  OLED_ShowString(0U, line, text, 8U);
+}
+
 static void OledStatus_Update(void)
 {
+  char line[17];
+
   oled_update_tick_count++;
   if (oled_update_tick_count < OLED_UPDATE_TICKS)
   {
@@ -285,14 +405,24 @@ static void OledStatus_Update(void)
   }
   oled_update_tick_count = 0U;
 
-  OLED_Clear();
-  OLED_ShowString(0U, 0U, "T1:", 16U);
-  OLED_ShowNum(24U, 0U, core_status.ad_t1_mv, 5U, 16U);
-  OLED_ShowString(64U, 0U, "mV", 16U);
+  OledDebug_Update();
 
-  OLED_ShowString(0U, 2U, "T2:", 16U);
-  OLED_ShowNum(24U, 2U, core_status.ad_t2_mv, 5U, 16U);
-  OLED_ShowString(64U, 2U, "mV", 16U);
+  (void)snprintf(line, sizeof(line), "T1:%5u mV", (unsigned int)core_status.ad_t1_mv);
+  OledWriteLine(2U, line);
+
+  (void)snprintf(line, sizeof(line), "T2:%5u mV", (unsigned int)core_status.ad_t2_mv);
+  OledWriteLine(3U, line);
+
+  {
+    int16_t temp_c10 = core_status.temperature_c10;
+    int16_t temp_abs = (temp_c10 < 0) ? (int16_t)(-temp_c10) : temp_c10;
+    int16_t temp_c = (int16_t)(temp_abs / 10);
+    int16_t temp_frac = (int16_t)(temp_abs % 10);
+    char sign = (temp_c10 < 0) ? '-' : '+';
+
+    (void)snprintf(line, sizeof(line), "Temp:%c%2d.%1dC", sign, temp_c, temp_frac);
+  }
+  OledWriteLine(4U, line);
 }
 
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
@@ -443,6 +573,45 @@ static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv)
   return (uint16_t)((sum + 1U) / 2U);
 }
 
+static int16_t TemperatureRawToC10(uint16_t raw)
+{
+  uint32_t v_sense_uv;
+  uint32_t v30_uv;
+  int32_t delta_uv;
+  int32_t temp_c10;
+  int32_t num;
+
+  v_sense_uv = (uint32_t)raw * ADC_REF_MV * 1000U;
+  v_sense_uv = (v_sense_uv + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
+
+  v30_uv = (uint32_t)(*TS_CAL1_ADDR) * TS_CAL1_VDDA_MV * 1000U;
+  v30_uv = (v30_uv + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
+
+  delta_uv = (int32_t)v_sense_uv - (int32_t)v30_uv;
+  temp_c10 = (int32_t)TS_CAL1_TEMP_C * 10;
+  num = delta_uv * 10;
+  if (num >= 0)
+  {
+    num += (int32_t)TS_AVG_SLOPE_UV_PER_C / 2;
+  }
+  else
+  {
+    num -= (int32_t)TS_AVG_SLOPE_UV_PER_C / 2;
+  }
+  temp_c10 += num / (int32_t)TS_AVG_SLOPE_UV_PER_C;
+
+  if (temp_c10 > INT16_MAX)
+  {
+    temp_c10 = INT16_MAX;
+  }
+  else if (temp_c10 < INT16_MIN)
+  {
+    temp_c10 = INT16_MIN;
+  }
+
+  return (int16_t)temp_c10;
+}
+
 static uint16_t AdjustPwm0Duty(uint16_t current_duty, uint16_t feedback_mv)
 {
   if (feedback_mv + PWM0_DEADBAND_MV < PWM0_TARGET_MV)
@@ -527,12 +696,14 @@ static void CoreProtection_Update(void)
     ad_t1_mv = ApplyVoltageScale(ad_t1_pin_mv, AD_T1_SCALE_NUM, AD_T1_SCALE_DEN);
     ad_t2_mv = ApplyVoltageScale(ad_t2_pin_mv, AD_T2_SCALE_NUM, AD_T2_SCALE_DEN);
     input_mv = ComputeInputVoltageMv(ad_t1_mv, ad_t2_mv);
+    core_status.temperature_c10 = TemperatureRawToC10(temperature_raw);
     core_status.adc_ok = 1U;
   }
   else
   {
     core_status.adc_ok = 0U;
     adc_fault = ADC_READ_FAIL_TRIGGERS_PROTECTION;
+    core_status.temperature_c10 = 0;
   }
   core_status.ad_t1_raw = ad_t1_raw;
   core_status.ad_t2_raw = ad_t2_raw;
