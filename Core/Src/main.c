@@ -89,6 +89,7 @@ typedef struct
 #define PWM0_DUTY_LIMIT_PERCENT               20U
 #define PWM0_DUTY_LIMIT                       ((PWM_DUTY_MAX * PWM0_DUTY_LIMIT_PERCENT) / 100U)
 #define PWM0_TARGET_MV                         10500U
+#define PWM1_FIXED_TARGET_MV                  1500U
 
 #if (PWM0_DUTY_LIMIT_PERCENT > 100U)
 #error "PWM0_DUTY_LIMIT_PERCENT must be <= 100"
@@ -248,6 +249,7 @@ static void CoreProtection_Init(void)
   }
 
   (void)HAL_ADCEx_Calibration_Start(&hadc);
+  /* Temporarily disable PWM2/PWM3 while debugging PWM1. */
   if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -744,6 +746,10 @@ static void ResetPwm0Pid(void)
 
 static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
 {
+  uint32_t duty;
+
+  /* PID algorithm disabled for now. Keep code commented for easy restore. */
+#if 0
   int32_t error = (int32_t)PWM0_TARGET_MV - (int32_t)feedback_mv;
   int32_t p_term;
   int32_t i_term;
@@ -781,6 +787,20 @@ static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
   }
 
   return (uint16_t)output;
+#endif
+  if (feedback_mv == 0U)
+  {
+    return 0U;
+  }
+
+  duty = ((uint32_t)PWM_DUTY_MAX * (uint32_t)PWM1_FIXED_TARGET_MV) + ((uint32_t)feedback_mv / 2U);
+  duty /= (uint32_t)feedback_mv;
+  if (duty > (uint32_t)PWM_DUTY_MAX)
+  {
+    duty = (uint32_t)PWM_DUTY_MAX;
+  }
+
+  return (uint16_t)duty;
 }
 
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2)
@@ -799,9 +819,11 @@ static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2)
   }
 
   /* PWM0 -> TIM1_CH1 (PWM1_Pin), PWM2/PWM3 as GPIO outputs. */
+  /* Temporarily disable PWM3 output while debugging PWM1/PWM2. */
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty0);
-  HAL_GPIO_WritePin(PWM2_GPIO_Port, PWM2_Pin, (duty1 > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(PWM3_GPIO_Port, PWM3_Pin, (duty2 > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(PWM2_GPIO_Port, PWM2_Pin, GPIO_PIN_RESET);
+  /* HAL_GPIO_WritePin(PWM3_GPIO_Port, PWM3_Pin, (duty2 > 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET); */
+  HAL_GPIO_WritePin(PWM3_GPIO_Port, PWM3_Pin, GPIO_PIN_RESET);
 
   pwm0_duty = duty0;
   pwm1_duty = duty1;
