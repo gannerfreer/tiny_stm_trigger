@@ -59,9 +59,6 @@ typedef struct
 #define CORE_LOGIC_PERIOD_MS                  20U
 #define ADC_POLL_TIMEOUT_MS                   5U
 
-#define TEMP_MIN                              0U
-#define TEMP_MAX                              4095U
-
 #define ADC_FULL_SCALE                        4095U
 #define ADC_REF_MV                            3300U
 #define TS_CAL1_ADDR                          ((uint16_t *)0x1FFFF7B8U)
@@ -114,7 +111,9 @@ typedef struct
 #define DIGITAL_STATE_GAS_D1                   (1U << 2)
 #define DIGITAL_STATE_GAS_D2                   (1U << 3)
 
-#define DIGITAL_INPUT_ACTIVE_LEVEL            GPIO_PIN_SET
+#define OPEN_ACTIVE_LEVEL                     GPIO_PIN_RESET
+#define CLOSE_ACTIVE_LEVEL                    GPIO_PIN_SET
+#define GAS_ACTIVE_LEVEL                      GPIO_PIN_SET
 #define DIGITAL_INPUT_STABLE_COUNT            3U
 
 #define ADC_READ_FAIL_TRIGGERS_PROTECTION     1U
@@ -141,6 +140,7 @@ typedef struct
 #define LED1_TOGGLE_TICKS                     (LED1_TOGGLE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 #define UART_STATUS_PRINT_TICKS               (UART_STATUS_PRINT_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
 #define OLED_UPDATE_TICKS                     (OLED_UPDATE_PERIOD_MS / CORE_LOGIC_PERIOD_MS)
+#define OLED_TRIGGER_PAGE_TICKS               5U
 
 /* If LED wiring is active-low (common), OFF=SET and ON=RESET. Adjust if needed. */
 #define LED_OFF_STATE                         GPIO_PIN_SET
@@ -203,8 +203,9 @@ static void OledWriteLine(uint8_t line, const char *text);
 static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
                                            uint16_t *ad_t2_raw,
                                            uint16_t *temperature_raw);
-static uint8_t IsOutOfRange(uint16_t value, uint16_t min_value, uint16_t max_value);
-static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level);
+static uint8_t UpdateDigitalCounter(uint8_t *counter,
+                                    GPIO_PinState level,
+                                    GPIO_PinState active_level);
 static uint8_t ReadDigitalFaultStable(void);
 static uint16_t AdcRawToMv(uint16_t raw);
 static uint16_t ApplyVoltageScale(uint16_t mv, uint32_t scale_num, uint32_t scale_den);
@@ -333,22 +334,18 @@ static uint8_t OledTryAppendToken(char *line, size_t line_size, const char *toke
   return 1U;
 }
 
-static void OledAppendToken(char *line0,
-                            size_t line0_size,
-                            char *line1,
-                            size_t line1_size,
-                            const char *token)
-{
-  if (OledTryAppendToken(line0, line0_size, token) == 0U)
-  {
-    (void)OledTryAppendToken(line1, line1_size, token);
-  }
-}
-
 static void OledDebug_Update(void)
 {
+  static uint8_t trigger_page;
+  static uint8_t trigger_page_tick;
   char line0[17];
   char line1[17];
+  char tokens[65];
+  size_t tokens_len;
+  size_t page_count;
+  size_t page_start;
+  size_t i;
+  uint8_t any_trigger = 0U;
 
   if (core_status.boot_guard_active != 0U)
   {
@@ -367,44 +364,94 @@ static void OledDebug_Update(void)
     (void)snprintf(line1, sizeof(line1), "up T-%lus", (unsigned long)remaining_s);
     OLED_Debug_PrintLine(0U, line0);
     OLED_Debug_PrintLine(1U, line1);
+    trigger_page = 0U;
+    trigger_page_tick = 0U;
     return;
   }
 
   line0[0] = '\0';
   line1[0] = '\0';
+  tokens[0] = '\0';
 
   if ((core_status.digital_state & DIGITAL_STATE_OPEN) != 0U)
   {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "OPEN");
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "OPEN");
+    any_trigger = 1U;
   }
   if ((core_status.digital_state & DIGITAL_STATE_CLOSE) != 0U)
   {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "CLOSE");
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "CLOSE");
+    any_trigger = 1U;
   }
   if ((core_status.digital_state & DIGITAL_STATE_GAS_D1) != 0U)
   {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "GAS1");
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "GAS1");
+    any_trigger = 1U;
   }
   if ((core_status.digital_state & DIGITAL_STATE_GAS_D2) != 0U)
   {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "GAS2");
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "GAS2");
+    any_trigger = 1U;
   }
   if (core_status.adc_ok == 0U)
   {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "ADC");
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "ADC");
+    any_trigger = 1U;
   }
   if (core_status.temp_fault != 0U)
   {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "TMP");
-  }
-  if (core_status.protection_latched != 0U)
-  {
-    OledAppendToken(line0, sizeof(line0), line1, sizeof(line1), "LAT");
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "TMP");
+    any_trigger = 1U;
   }
 
-  if ((line0[0] == '\0') && (line1[0] == '\0'))
+  if (any_trigger == 0U)
   {
-    (void)snprintf(line0, sizeof(line0), "OK");
+    (void)snprintf(line0, sizeof(line0), "System Idle");
+    OLED_Debug_PrintLine(0U, line0);
+    OLED_Debug_PrintLine(1U, "");
+    trigger_page = 0U;
+    trigger_page_tick = 0U;
+    return;
+  }
+
+  (void)snprintf(line0, sizeof(line0), "[System Action]");
+  tokens_len = strlen(tokens);
+  if (tokens_len == 0U)
+  {
+    line1[0] = '\0';
+  }
+  else
+  {
+    page_count = (tokens_len + 15U) / 16U;
+    if (page_count == 0U)
+    {
+      page_count = 1U;
+    }
+    if (trigger_page >= page_count)
+    {
+      trigger_page = 0U;
+    }
+    trigger_page_tick++;
+    if (trigger_page_tick >= OLED_TRIGGER_PAGE_TICKS)
+    {
+      trigger_page_tick = 0U;
+      trigger_page++;
+      if (trigger_page >= page_count)
+      {
+        trigger_page = 0U;
+      }
+    }
+
+    page_start = (size_t)trigger_page * 16U;
+    for (i = 0U; i < 16U; i++)
+    {
+      if ((page_start + i) >= tokens_len)
+      {
+        break;
+      }
+      line1[i] = tokens[page_start + i];
+    }
+    line1[i] = '\0';
   }
 
   OLED_Debug_PrintLine(0U, line0);
@@ -540,18 +587,11 @@ static HAL_StatusTypeDef ReadCoreAdcInputs(uint16_t *ad_t1_raw,
   return HAL_OK;
 }
 
-static uint8_t IsOutOfRange(uint16_t value, uint16_t min_value, uint16_t max_value)
+static uint8_t UpdateDigitalCounter(uint8_t *counter,
+                                    GPIO_PinState level,
+                                    GPIO_PinState active_level)
 {
-  if ((value < min_value) || (value > max_value))
-  {
-    return 1U;
-  }
-  return 0U;
-}
-
-static uint8_t UpdateDigitalCounter(uint8_t *counter, GPIO_PinState level)
-{
-  if (level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  if (level == active_level)
   {
     if (*counter < DIGITAL_INPUT_STABLE_COUNT)
     {
@@ -587,27 +627,27 @@ static uint8_t ReadDigitalFaultStable(void)
   gas_d1_level = HAL_GPIO_ReadPin(GAS_D1_GPIO_Port, GAS_D1_Pin);
   gas_d2_level = HAL_GPIO_ReadPin(GAS_D2_GPIO_Port, GAS_D2_Pin);
 
-  if (open_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  if (open_level == OPEN_ACTIVE_LEVEL)
   {
     digital_state |= DIGITAL_STATE_OPEN;
   }
-  if (close_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  if (close_level == CLOSE_ACTIVE_LEVEL)
   {
     digital_state |= DIGITAL_STATE_CLOSE;
   }
-  if (gas_d1_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  if (gas_d1_level == GAS_ACTIVE_LEVEL)
   {
     digital_state |= DIGITAL_STATE_GAS_D1;
   }
-  if (gas_d2_level == DIGITAL_INPUT_ACTIVE_LEVEL)
+  if (gas_d2_level == GAS_ACTIVE_LEVEL)
   {
     digital_state |= DIGITAL_STATE_GAS_D2;
   }
 
-  open_active = UpdateDigitalCounter(&digital_active_counts[0], open_level);
-  close_active = UpdateDigitalCounter(&digital_active_counts[1], close_level);
-  gas_d1_active = UpdateDigitalCounter(&digital_active_counts[2], gas_d1_level);
-  gas_d2_active = UpdateDigitalCounter(&digital_active_counts[3], gas_d2_level);
+  open_active = UpdateDigitalCounter(&digital_active_counts[0], open_level, OPEN_ACTIVE_LEVEL);
+  close_active = UpdateDigitalCounter(&digital_active_counts[1], close_level, CLOSE_ACTIVE_LEVEL);
+  gas_d1_active = UpdateDigitalCounter(&digital_active_counts[2], gas_d1_level, GAS_ACTIVE_LEVEL);
+  gas_d2_active = UpdateDigitalCounter(&digital_active_counts[3], gas_d2_level, GAS_ACTIVE_LEVEL);
 
   core_status.digital_state = digital_state;
 
@@ -798,13 +838,13 @@ static void CoreProtection_Update(void)
 
   if (ReadCoreAdcInputs(&ad_t1_raw, &ad_t2_raw, &temperature_raw) == HAL_OK)
   {
-    temp_fault = IsOutOfRange(temperature_raw, TEMP_MIN, TEMP_MAX);
     ad_t1_pin_mv = AdcRawToMv(ad_t1_raw);
     ad_t2_pin_mv = AdcRawToMv(ad_t2_raw);
     ad_t1_mv = ApplyVoltageScale(ad_t1_pin_mv, AD_T1_SCALE_NUM, AD_T1_SCALE_DEN);
     ad_t2_mv = ApplyVoltageScale(ad_t2_pin_mv, AD_T2_SCALE_NUM, AD_T2_SCALE_DEN);
     input_mv = ComputeInputVoltageMv(ad_t1_mv, ad_t2_mv);
     core_status.temperature_c10 = TemperatureRawToC10(temperature_raw);
+    temp_fault = (core_status.temperature_c10 > 700) ? 1U : 0U;
     core_status.adc_ok = 1U;
   }
   else
@@ -1253,13 +1293,13 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pins : GAS_D1_Pin GAS_D2_Pin */
   GPIO_InitStruct.Pin = GAS_D1_Pin|GAS_D2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : CLOSE_Pin OPEN_Pin */
   GPIO_InitStruct.Pin = CLOSE_Pin|OPEN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LED0_Pin LED1_Pin */
