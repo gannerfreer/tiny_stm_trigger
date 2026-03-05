@@ -2,6 +2,7 @@
 #include "Oled/oledfont.h"
 
 static I2C_HandleTypeDef *oled_i2c;
+static uint8_t oled_available;
 
 #define OLED_DEBUG_LINE_COUNT 2U
 #define OLED_DEBUG_MAX_CHARS 16U
@@ -14,19 +15,26 @@ static uint8_t OLED_IsPrintableAscii(uint8_t ch)
 static HAL_StatusTypeDef OLED_I2C_Write(uint8_t control, uint8_t data)
 {
   uint8_t buffer[2];
+  HAL_StatusTypeDef status;
 
-  if (oled_i2c == NULL)
+  if ((oled_i2c == NULL) || (oled_available == 0U))
   {
     return HAL_ERROR;
   }
 
   buffer[0] = control;
   buffer[1] = data;
-  return HAL_I2C_Master_Transmit(oled_i2c,
-                                 (uint16_t)(OLED_I2C_ADDR_7BIT << 1U),
-                                 buffer,
-                                 (uint16_t)sizeof(buffer),
-                                 OLED_I2C_TIMEOUT_MS);
+  status = HAL_I2C_Master_Transmit(oled_i2c,
+                                   (uint16_t)(OLED_I2C_ADDR_7BIT << 1U),
+                                   buffer,
+                                   (uint16_t)sizeof(buffer),
+                                   OLED_I2C_TIMEOUT_MS);
+  if (status != HAL_OK)
+  {
+    /* Stop further OLED transfers after bus/device failure to avoid blocking main loop. */
+    oled_available = 0U;
+  }
+  return status;
 }
 
 void OLED_WR_Byte(uint8_t dat, uint8_t cmd)
@@ -60,6 +68,11 @@ void OLED_Clear(void)
   uint8_t i;
   uint8_t n;
 
+  if (oled_available == 0U)
+  {
+    return;
+  }
+
   for (i = 0U; i < 8U; i++)
   {
     OLED_WR_Byte((uint8_t)(0xB0U + i), OLED_CMD);
@@ -74,6 +87,11 @@ void OLED_Clear(void)
 
 void OLED_Set_Pos(uint8_t x, uint8_t y)
 {
+  if (oled_available == 0U)
+  {
+    return;
+  }
+
   OLED_WR_Byte((uint8_t)(0xB0U + y), OLED_CMD);
   OLED_WR_Byte((uint8_t)(((x & 0xF0U) >> 4U) | 0x10U), OLED_CMD);
   OLED_WR_Byte((uint8_t)(x & 0x0FU), OLED_CMD);
@@ -83,6 +101,11 @@ void OLED_ShowChar(uint8_t x, uint8_t y, uint8_t chr, uint8_t char_size)
 {
   uint8_t i;
   uint8_t c;
+
+  if (oled_available == 0U)
+  {
+    return;
+  }
 
   c = (uint8_t)(chr - ' ');
   if (x > (Max_Column - 1U))
@@ -154,7 +177,7 @@ void OLED_ShowString(uint8_t x, uint8_t y, const char *chr, uint8_t char_size)
 {
   uint8_t j = 0U;
 
-  if (chr == NULL)
+  if ((chr == NULL) || (oled_available == 0U))
   {
     return;
   }
@@ -212,39 +235,28 @@ uint8_t OLED_Debug_PrintLine(uint8_t line, const char *text)
 //   }
 // }
 
-void OLED_DrawBMP(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1, const unsigned char *bmp)
+void OLED_Init(I2C_HandleTypeDef *hi2c)
 {
-  uint32_t j = 0U;
-  uint8_t x;
-  uint8_t y;
+  HAL_StatusTypeDef status;
 
-  if (bmp == NULL)
+  oled_i2c = hi2c;
+  oled_available = 0U;
+
+  if (oled_i2c == NULL)
   {
     return;
   }
 
-  if ((y1 % 8U) == 0U)
+  status = HAL_I2C_IsDeviceReady(oled_i2c,
+                                 (uint16_t)(OLED_I2C_ADDR_7BIT << 1U),
+                                 2U,
+                                 2U);
+  if (status != HAL_OK)
   {
-    y = (uint8_t)(y1 / 8U);
-  }
-  else
-  {
-    y = (uint8_t)(y1 / 8U + 1U);
+    return;
   }
 
-  for (y = y0; y < y1; y++)
-  {
-    OLED_Set_Pos(x0, y);
-    for (x = x0; x < x1; x++)
-    {
-      OLED_WR_Byte(bmp[j++], OLED_DATA);
-    }
-  }
-}
-
-void OLED_Init(I2C_HandleTypeDef *hi2c)
-{
-  oled_i2c = hi2c;
+  oled_available = 1U;
 
   HAL_Delay(800U);
   OLED_WR_Byte(0xAEU, OLED_CMD);

@@ -38,7 +38,6 @@ void OLED_ShowChar(uint8_t x, uint8_t y, uint8_t chr, uint8_t char_size);
 void OLED_ShowNum(uint8_t x, uint8_t y, uint32_t num, uint8_t len, uint8_t size);
 void OLED_ShowString(uint8_t x, uint8_t y, const char *p, uint8_t char_size);
 void OLED_ShowCHinese(uint8_t x, uint8_t y, uint8_t no);
-void OLED_DrawBMP(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1, const unsigned char *bmp);
 void OLED_WR_Byte(uint8_t dat, uint8_t cmd);
 uint8_t OLED_Debug_PrintLine(uint8_t line, const char *text);
 void Delay_50ms(uint32_t delay_50ms);

@@ -62,9 +62,9 @@ typedef struct
 #define ADC_FULL_SCALE                        4095U
 #define ADC_REF_MV                            3300U
 #define TS_CAL1_ADDR                          ((uint16_t *)0x1FFFF7B8U)
+#define TS_CAL2_ADDR                          ((uint16_t *)0x1FFFF7C2U)
 #define TS_CAL1_TEMP_C                        30
-#define TS_CAL1_VDDA_MV                        3300U
-#define TS_AVG_SLOPE_UV_PER_C                 4300U
+#define TS_CAL2_TEMP_C                        110
 
 /* TODO: replace divider/calibration factors with measured values. */
 /* AD_T1: 10k (top) / 2.2k (bottom) divider => V_in = V_adc * (12.2 / 2.2) = 61/11 */
@@ -90,9 +90,20 @@ typedef struct
 #define PWM0_DUTY_LIMIT                       ((PWM_DUTY_MAX * PWM0_DUTY_LIMIT_PERCENT) / 100U)
 #define PWM0_TARGET_MV                         10500U
 #define PWM1_FIXED_TARGET_MV                  1500U
+#define PWM0_MAX_DUTY_PERCENT                 12U
+#define PWM0_MAX_DUTY_COUNTS                  ((uint16_t)((((uint32_t)PWM_DUTY_MAX * PWM0_MAX_DUTY_PERCENT) + 50U) / 100U))
+#define PWM0_MIN_ENABLE_MV                    6000U
+#define PWM0_RAMP_INTERVAL_MS                 20U
+#define PWM0_RAMP_UP_STEP_COUNTS              ((uint16_t)((PWM_DUTY_MAX + 99U) / 100U))
+#define PWM0_RAMP_DOWN_STEP_COUNTS            ((uint16_t)(PWM0_RAMP_UP_STEP_COUNTS * 20U))
+#define OUTPUT_AUTO_OFF_MS                    15000U
 
 #if (PWM0_DUTY_LIMIT_PERCENT > 100U)
 #error "PWM0_DUTY_LIMIT_PERCENT must be <= 100"
+#endif
+
+#if ((PWM0_RAMP_INTERVAL_MS % CORE_LOGIC_PERIOD_MS) != 0)
+#error "PWM0_RAMP_INTERVAL_MS must be a multiple of CORE_LOGIC_PERIOD_MS"
 #endif
 
 /* PID gains: duty = Kp*err + Ki*sum(err) + Kd*dErr. Tune as needed. */
@@ -114,13 +125,11 @@ typedef struct
 
 #define OPEN_ACTIVE_LEVEL                     GPIO_PIN_RESET
 #define CLOSE_ACTIVE_LEVEL                    GPIO_PIN_SET
-#define GAS_ACTIVE_LEVEL                      GPIO_PIN_SET
-#define DIGITAL_INPUT_STABLE_COUNT            3U
-
-#define ADC_READ_FAIL_TRIGGERS_PROTECTION     1U
+#define GAS_ACTIVE_LEVEL                      GPIO_PIN_RESET
+#define DIGITAL_INPUT_STABLE_COUNT            10U
 
 #define LED0_TOGGLE_PERIOD_MS                500U
-#define LED1_TOGGLE_PERIOD_MS                100U
+#define LED1_TOGGLE_PERIOD_MS                 20U
 #define UART_STATUS_PRINT_PERIOD_MS          500U
 #define OLED_UPDATE_PERIOD_MS                200U
 
@@ -173,8 +182,10 @@ static uint16_t led0_tick_count;
 static uint16_t led1_tick_count;
 static uint16_t uart_print_tick_count;
 static uint16_t oled_update_tick_count;
+static uint16_t pwm0_ramp_tick_count;
 static int32_t pwm0_pid_integral;
 static int32_t pwm0_pid_prev_error;
+static uint32_t output_enable_start_ms;
 static CoreStatusSnapshot core_status;
 static uint32_t adc_fail_count;
 static uint32_t adc_last_error;
@@ -214,6 +225,8 @@ static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv);
 static int16_t TemperatureRawToC10(uint16_t raw);
 static void ResetPwm0Pid(void);
 static uint16_t AdjustPwm0Duty(uint16_t feedback_mv);
+static void ResetPwm0Ramp(void);
+static uint16_t RampPwm0Duty(uint16_t target, uint8_t force_off);
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2);
 
 /* USER CODE END PFP */
@@ -233,8 +246,10 @@ static void CoreProtection_Init(void)
   led1_tick_count = 0U;
   uart_print_tick_count = 0U;
   oled_update_tick_count = 0U;
+  pwm0_ramp_tick_count = 0U;
   pwm0_pid_integral = 0;
   pwm0_pid_prev_error = 0;
+  output_enable_start_ms = 0U;
   core_status = (CoreStatusSnapshot){0};
   adc_fail_count = 0U;
   adc_last_error = 0U;
@@ -403,6 +418,11 @@ static void OledDebug_Update(void)
   if (core_status.temp_fault != 0U)
   {
     (void)OledTryAppendToken(tokens, sizeof(tokens), "TMP");
+    any_trigger = 1U;
+  }
+  if (core_status.protection_latched != 0U)
+  {
+    (void)OledTryAppendToken(tokens, sizeof(tokens), "RUN");
     any_trigger = 1U;
   }
 
@@ -701,30 +721,29 @@ static uint16_t ComputeInputVoltageMv(uint16_t ad_t1_mv, uint16_t ad_t2_mv)
 
 static int16_t TemperatureRawToC10(uint16_t raw)
 {
-  uint32_t v_sense_uv;
-  uint32_t v30_uv;
-  int32_t delta_uv;
+  int32_t cal1 = (int32_t)(*TS_CAL1_ADDR);
+  int32_t cal2 = (int32_t)(*TS_CAL2_ADDR);
+  int32_t raw_i = (int32_t)raw;
   int32_t temp_c10;
+  int32_t denom = cal2 - cal1;
   int32_t num;
 
-  v_sense_uv = (uint32_t)raw * ADC_REF_MV * 1000U;
-  v_sense_uv = (v_sense_uv + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
+  /* RM0360 temperature formula using two calibration points (no voltage conversion). */
+  if (denom == 0)
+  {
+    return 0;
+  }
 
-  v30_uv = (uint32_t)(*TS_CAL1_ADDR) * TS_CAL1_VDDA_MV * 1000U;
-  v30_uv = (v30_uv + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
-
-  delta_uv = (int32_t)v_sense_uv - (int32_t)v30_uv;
-  temp_c10 = (int32_t)TS_CAL1_TEMP_C * 10;
-  num = delta_uv * 10;
+  num = (raw_i - cal1) * (TS_CAL2_TEMP_C - TS_CAL1_TEMP_C) * 10;
   if (num >= 0)
   {
-    num += (int32_t)TS_AVG_SLOPE_UV_PER_C / 2;
+    num += denom / 2;
   }
   else
   {
-    num -= (int32_t)TS_AVG_SLOPE_UV_PER_C / 2;
+    num -= denom / 2;
   }
-  temp_c10 += num / (int32_t)TS_AVG_SLOPE_UV_PER_C;
+  temp_c10 = (num / denom) + ((int32_t)TS_CAL1_TEMP_C * 10);
 
   if (temp_c10 > INT16_MAX)
   {
@@ -742,6 +761,11 @@ static void ResetPwm0Pid(void)
 {
   pwm0_pid_integral = 0;
   pwm0_pid_prev_error = 0;
+}
+
+static void ResetPwm0Ramp(void)
+{
+  pwm0_ramp_tick_count = 0U;
 }
 
 static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
@@ -803,6 +827,50 @@ static uint16_t AdjustPwm0Duty(uint16_t feedback_mv)
   return (uint16_t)duty;
 }
 
+static uint16_t RampPwm0Duty(uint16_t target, uint8_t force_off)
+{
+  uint16_t current = pwm0_duty;
+  uint16_t next = current;
+
+  if (force_off != 0U)
+  {
+    pwm0_ramp_tick_count = 0U;
+    return 0U;
+  }
+
+  pwm0_ramp_tick_count++;
+  if (pwm0_ramp_tick_count < (PWM0_RAMP_INTERVAL_MS / CORE_LOGIC_PERIOD_MS))
+  {
+    return current;
+  }
+  pwm0_ramp_tick_count = 0U;
+
+  if (target > current)
+  {
+    uint32_t step = PWM0_RAMP_UP_STEP_COUNTS;
+    uint32_t sum = (uint32_t)current + step;
+    next = (sum > target) ? target : (uint16_t)sum;
+  }
+  else if (target < current)
+  {
+    uint32_t step = PWM0_RAMP_DOWN_STEP_COUNTS;
+    if (step >= current)
+    {
+      next = 0U;
+    }
+    else
+    {
+      next = (uint16_t)(current - step);
+    }
+    if (next < target)
+    {
+      next = target;
+    }
+  }
+
+  return next;
+}
+
 static void ApplyPwmOutputs(uint16_t duty0, uint16_t duty1, uint16_t duty2)
 {
   if (duty0 > PWM_DUTY_MAX)
@@ -838,9 +906,9 @@ static void CoreProtection_Update(void)
   uint32_t now_ms;
   uint8_t boot_guard_active;
   uint8_t digital_fault;
-  uint8_t adc_fault = 0U;
   uint8_t temp_fault = 0U;
-  uint8_t protection_triggered;
+  uint8_t trigger_success = 0U;
+  uint8_t force_pwm0_off = 0U;
   uint16_t ad_t1_raw = 0U;
   uint16_t ad_t2_raw = 0U;
   uint16_t temperature_raw = 0U;
@@ -850,6 +918,7 @@ static void CoreProtection_Update(void)
   uint16_t ad_t2_mv = 0U;
   uint16_t input_mv = 0U;
   uint16_t target_pwm0;
+  uint16_t ramped_pwm0;
 
   now_ms = HAL_GetTick();
 
@@ -872,7 +941,6 @@ static void CoreProtection_Update(void)
   else
   {
     core_status.adc_ok = 0U;
-    adc_fault = ADC_READ_FAIL_TRIGGERS_PROTECTION;
     core_status.temperature_c10 = 0;
   }
   core_status.ad_t1_raw = ad_t1_raw;
@@ -883,25 +951,41 @@ static void CoreProtection_Update(void)
   core_status.temperature_raw = temperature_raw;
   core_status.temp_fault = temp_fault;
 
-  protection_triggered = ((adc_fault != 0U) || (temp_fault != 0U) || (digital_fault != 0U)) ? 1U : 0U;
-
   if (boot_guard_active != 0U)
   {
     protection_latched = 0U;
+    output_enable_start_ms = 0U;
     ResetPwm0Pid();
+    ResetPwm0Ramp();
     ApplyPwmOutputs(0U, 0U, 0U);
     core_status.protection_latched = protection_latched;
     return;
   }
 
-  if (protection_triggered != 0U)
+  trigger_success = ((digital_fault != 0U) &&
+                     (protection_latched == 0U)) ? 1U : 0U;
+
+  if (trigger_success != 0U)
   {
     protection_latched = 1U;
+    output_enable_start_ms = now_ms;
+  }
+
+  if ((protection_latched != 0U) && ((now_ms - output_enable_start_ms) >= OUTPUT_AUTO_OFF_MS))
+  {
+    protection_latched = 0U;
+    ResetPwm0Pid();
+    ResetPwm0Ramp();
+    ApplyPwmOutputs(0U, 0U, 0U);
+    core_status.protection_latched = protection_latched;
+    return;
   }
 
   if (protection_latched == 0U)
   {
+    output_enable_start_ms = 0U;
     ResetPwm0Pid();
+    ResetPwm0Ramp();
     ApplyPwmOutputs(0U, 0U, 0U);
     core_status.protection_latched = protection_latched;
     return;
@@ -913,6 +997,7 @@ static void CoreProtection_Update(void)
     {
       target_pwm0 = 0U;
       ResetPwm0Pid();
+      ResetPwm0Ramp();
     }
     else
     {
@@ -923,9 +1008,21 @@ static void CoreProtection_Update(void)
   {
     target_pwm0 = 0U;
     ResetPwm0Pid();
+    ResetPwm0Ramp();
   }
 
-  ApplyPwmOutputs(target_pwm0, PWM_DUTY_MAX, PWM_DUTY_MAX);
+  if (ad_t1_mv < PWM0_MIN_ENABLE_MV)
+  {
+    force_pwm0_off = 1U;
+    target_pwm0 = 0U;
+  }
+  else if (target_pwm0 > PWM0_MAX_DUTY_COUNTS)
+  {
+    target_pwm0 = PWM0_MAX_DUTY_COUNTS;
+  }
+
+  ramped_pwm0 = RampPwm0Duty(target_pwm0, force_pwm0_off);
+  ApplyPwmOutputs(ramped_pwm0, PWM_DUTY_MAX, PWM_DUTY_MAX);
   core_status.protection_latched = protection_latched;
 }
 
@@ -1315,7 +1412,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pins : GAS_D1_Pin GAS_D2_Pin */
   GPIO_InitStruct.Pin = GAS_D1_Pin|GAS_D2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : CLOSE_Pin OPEN_Pin */
